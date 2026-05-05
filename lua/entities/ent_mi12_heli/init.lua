@@ -23,18 +23,10 @@ local ALT_DRIFT_LERP  = ENT.AltDriftLerp
 local JITTER_AMP      = ENT.JitterAmplitude
 local ALERT_INTERVAL  = ENT.AlertInterval
 
--- ============================================================
---  DOOR PROP MODELS
---  Exact same models used by the original LFS SpawnFunction.
---  Both props are parented to the heli.
---  CLOSED state: doormdl  (Door_Closed) solid,   doormdl2 (Door_Open) non-solid
---  OPEN   state: doormdl  (Door_Closed) non-solid, doormdl2 (Door_Open) solid
---  (Matches LFS PrimaryAttack solidity logic exactly.)
---  NOTE: PlayAnimation("Open"/"Close") is an LFS vehicle base method
---  that does not exist on base_anim — we omit it intentionally.
--- ============================================================
-local DOOR_MDL_CLOSED = "models/tfre/vehicles/Mi12_Homer_Door_Closed.mdl"
-local DOOR_MDL_OPEN   = "models/tfre/vehicles/Mi12_Homer_Door_Open.mdl"
+-- Door bodygroup constants (from shared.lua)
+local DOOR_BG_IDX   = ENT.DoorBodygroupIndex  -- 1
+local DOOR_BG_OPEN  = ENT.DoorBodygroupOpen   -- 1
+local DOOR_BG_CLOSE = ENT.DoorBodygroupClose  -- 0
 
 -- ============================================================
 --  FLIGHT CONSTANTS
@@ -155,38 +147,16 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR — prop pair, exact LFS SpawnFunction pattern
+--  DOOR — bodygroup on Mi12_Homer.mdl
+--
+--  Mi12_Homer.mdl has the door baked in as bodygroup index 1:
+--    value 0 = door closed (default)
+--    value 1 = door open
+--
+--  The separate Mi12_Homer_Door_Closed.mdl / Door_Open.mdl only
+--  exist for the LFS rideable vehicle variant; they are NOT
+--  present in this NPC pack and must NOT be spawned as props.
 -- ============================================================
-local function SpawnDoorProps(ent)
-    -- doormdl = Closed model (solid at start = doors closed)
-    local dc = ents.Create("prop_physics")
-    dc:SetModel(DOOR_MDL_CLOSED)
-    dc:SetPos(ent:GetPos())
-    dc:SetAngles(ent:GetAngles())
-    dc.DoNotDuplicate = true
-    dc:SetParent(ent)
-    dc:Spawn()
-    dc:SetNotSolid(false)   -- solid = visible / closed state
-    ent.doormdl = dc
-
-    -- doormdl2 = Open model (non-solid at start = hidden)
-    local do2 = ents.Create("prop_physics")
-    do2:SetModel(DOOR_MDL_OPEN)
-    do2:SetPos(ent:GetPos())
-    do2:SetAngles(ent:GetAngles())
-    do2.DoNotDuplicate = true
-    do2:SetParent(ent)
-    do2:Spawn()
-    do2:SetNotSolid(true)   -- non-solid = hidden / open state
-    ent.doormdl2 = do2
-
-    -- Same cleanup hook as LFS CallOnRemove
-    ent:CallOnRemove("RemoveDoorProps", function(e)
-        if IsValid(e.doormdl)  then e.doormdl:Remove()  end
-        if IsValid(e.doormdl2) then e.doormdl2:Remove() end
-    end)
-end
-
 local function BroadcastDoorEvent(ent, isOpen)
     net.Start("MI12_DoorEvent")
         net.WriteEntity(ent)
@@ -197,18 +167,14 @@ end
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    -- LFS PrimaryAttack (doornum==0 branch): doormdl goes non-solid
-    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(true)  end
-    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(false) end
+    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_OPEN)
     BroadcastDoorEvent(self, true)
 end
 
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    -- LFS PrimaryAttack (else branch): doormdl goes solid again
-    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(false) end
-    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(true)  end
+    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_CLOSE)
     BroadcastDoorEvent(self, false)
 end
 
@@ -287,8 +253,7 @@ function ENT:ManhackBurst()
         )
     end
 
-    local closeKey = "mi12_door_close_" .. self:EntIndex()
-    timer.Remove(closeKey)
+    timer.Remove("mi12_door_close_" .. self:EntIndex())
     timer.Simple(DOOR_OPEN_TIME, function()
         if IsValid(self) and not self.IsDestroyed then self:CloseDoors() end
     end)
@@ -388,13 +353,13 @@ function ENT:Initialize()
     self:SetColor(Color(255,255,255,0))
     self:SetHealth(MAX_HP)
 
-    -- Rotor blur bodygroups
+    -- Rotor blur bodygroups (2 and 3 are the blurred rotor discs)
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- Spawn door prop pair, doors start closed
+    -- Door starts closed (bodygroup 1 = 0)
     self.DoorIsOpen = false
-    SpawnDoorProps(self)
+    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_CLOSE)
 
     local orbitDir = (math.random(2) == 1) and 1 or -1
     local right    = Vector(-dir.y, dir.x, 0)
@@ -683,5 +648,4 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
-    -- door props cleaned up by CallOnRemove("RemoveDoorProps") hook
 end
