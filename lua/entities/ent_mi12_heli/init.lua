@@ -11,7 +11,7 @@ include("shared.lua")
 util.AddNetworkString("bombin_mi12_damage_tier")
 
 -- ============================================================
---  CACHE SHARED CONSTANTS (ENT global dies after file exec)
+--  CACHE SHARED CONSTANTS
 -- ============================================================
 local MODEL_PATH      = ENT.ModelPath
 local DOOR_MDL_CLOSED = ENT.DoorModelClosed
@@ -39,6 +39,19 @@ local ROLL_LERP_OUT       = 0.01
 local GIB_LIFETIME        = 40
 
 local TWO_PI = math.pi * 2
+
+-- ============================================================
+--  MANHACK ABILITY CONSTANTS
+-- ============================================================
+local MANHACK_CAP        = 20      -- global live manhack ceiling
+local MANHACK_BURST      = 2       -- how many per launch
+local MANHACK_INTERVAL   = 0.25    -- seconds between bursts
+local MANHACK_COUNT_INT  = 5       -- seconds between cap re-checks
+local MANHACK_LAUNCH_SPD = 1200    -- HU/s launch velocity
+-- Local-space offset from entity origin toward the tail.
+-- MI-12 faces +X (yaw 0 = forward +X), so tail is in the -X direction.
+-- Adjust the X component if the model's tail sits differently.
+local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)
 
 -- ============================================================
 --  HELPERS
@@ -150,6 +163,158 @@ local function SpawnGibs(origin)
             end)
         end)
     end
+end
+
+-- ============================================================
+--  MANHACK ABILITY
+-- ============================================================
+
+-- Returns the nearest valid target (player alive or rebel NPC) to `origin`.
+-- Returns nil if no valid target exists.
+local function FindNearestTarget(origin)
+    local bestDist = math.huge
+    local bestEnt  = nil
+
+    -- Check players
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) and ply:Alive() and not ply:IsObserver() then
+            local d = origin:DistToSqr(ply:GetPos())
+            if d < bestDist then
+                bestDist = d
+                bestEnt  = ply
+            end
+        end
+    end
+
+    -- Check rebel NPCs
+    for _, npc in ipairs(ents.FindByClass("npc_citizen")) do
+        if IsValid(npc) and npc:Health() > 0 then
+            local d = origin:DistToSqr(npc:GetPos())
+            if d < bestDist then
+                bestDist = d
+                bestEnt  = npc
+            end
+        end
+    end
+
+    return bestEnt
+end
+
+-- Computes the world-space tail position by rotating TAIL_LOCAL_OFFSET
+-- by the helicopter's current angles.
+local function GetTailPos(heli)
+    local ang = heli:GetAngles()
+    local fwd, right, up = ang:Forward(), ang:Right(), ang:Up()
+    -- LocalToWorld equivalent without a parent entity:
+    -- world = origin + fwd*x + right*y + up*z
+    local o = TAIL_LOCAL_OFFSET
+    return heli:GetPos()
+        + fwd   * o.x
+        + right * o.y
+        + up    * o.z
+end
+
+-- Launches one manhack from `spawnPos` pre-agro toward `target`.
+local function LaunchManhack(spawnPos, target)
+    local mh = ents.Create("npc_manhack")
+    if not IsValid(mh) then return end
+
+    mh:SetPos(spawnPos)
+    -- Orient the manhack roughly toward the target so its local forward
+    -- is already aimed on spawn.
+    local toTarget = (target:GetPos() - spawnPos)
+    toTarget.z = 0
+    if toTarget:LengthSqr() > 1 then
+        toTarget:Normalize()
+        mh:SetAngles(toTarget:Angle())
+    end
+
+    mh:Spawn()
+    mh:Activate()
+
+    -- Pre-agro: set enemy and memory before the NPC runs its first Think.
+    mh:SetEnemy(target)
+    if mh.UpdateEnemyMemory then
+        mh:UpdateEnemyMemory(target, target:GetPos())
+    end
+    mh:SetSchedule(SCHED_CHASE_ENEMY)
+
+    -- Launch: apply velocity toward target.
+    local ph = mh:GetPhysicsObject()
+    if IsValid(ph) then
+        ph:Wake()
+        local vel = (target:GetPos() - spawnPos)
+        if vel:LengthSqr() > 1 then
+            vel:Normalize()
+        else
+            vel = Vector(0, 0, -1)
+        end
+        ph:SetVelocity(vel * MANHACK_LAUNCH_SPD)
+    end
+end
+
+-- Burst: launches MANHACK_BURST manhacks if the global cap is not yet hit.
+-- `blocked` is the cached flag; the 5s timer refreshes it.
+function ENT:ManhackBurst()
+    if self.IsDestroyed then return end
+    if self.ManhackBlocked then return end
+
+    local tailPos = GetTailPos(self)
+    local target  = FindNearestTarget(tailPos)
+    if not IsValid(target) then return end
+
+    for i = 1, MANHACK_BURST do
+        -- Slight spread on spawn position so they don't stack on the same point.
+        local spread = Vector(
+            math.Rand(-30, 30),
+            math.Rand(-30, 30),
+            math.Rand(-20, 20)
+        )
+        LaunchManhack(tailPos + spread, target)
+    end
+end
+
+-- Re-counts live manhacks every MANHACK_COUNT_INT seconds.
+-- Sets self.ManhackBlocked = true when at or over cap.
+function ENT:ManhackCountCheck()
+    if not IsValid(self) then return end
+    local count = #ents.FindByClass("npc_manhack")
+    self.ManhackBlocked = (count >= MANHACK_CAP)
+end
+
+-- Starts both the burst timer and the count-check timer, keyed by EntIndex
+-- so multiple instances never collide.
+function ENT:StartManhackSystem()
+    local idx = self:EntIndex()
+
+    self.ManhackBlocked   = false
+    self.ManhackBurstName = "mi12_manhack_burst_" .. idx
+    self.ManhackCountName = "mi12_manhack_count_" .. idx
+
+    -- Burst timer: fires every MANHACK_INTERVAL.
+    timer.Create(self.ManhackBurstName, MANHACK_INTERVAL, 0, function()
+        if not IsValid(self) then
+            timer.Remove(self.ManhackBurstName)
+            return
+        end
+        self:ManhackBurst()
+    end)
+
+    -- Count timer: refreshes the blocked flag every MANHACK_COUNT_INT seconds.
+    -- Runs immediately once so the very first burst has a valid flag.
+    self:ManhackCountCheck()
+    timer.Create(self.ManhackCountName, MANHACK_COUNT_INT, 0, function()
+        if not IsValid(self) then
+            timer.Remove(self.ManhackCountName)
+            return
+        end
+        self:ManhackCountCheck()
+    end)
+end
+
+function ENT:StopManhackSystem()
+    if self.ManhackBurstName then timer.Remove(self.ManhackBurstName) end
+    if self.ManhackCountName  then timer.Remove(self.ManhackCountName)  end
 end
 
 -- ============================================================
@@ -265,6 +430,7 @@ function ENT:Initialize()
     self:SetBodygroup(3, 1)
 
     self:SpawnDoors()
+    self:StartManhackSystem()
 
     self.EngineLoop = CreateSound(self, "tfre_mi12")
     if self.EngineLoop then
@@ -540,6 +706,8 @@ function ENT:DestroyHeli()
     if self.IsDestroyed then return end
     self.IsDestroyed = true
 
+    self:StopManhackSystem()
+
     if IsValid(self.doorClosed) then self.doorClosed:Remove() end
     if IsValid(self.doorOpen)   then self.doorOpen:Remove() end
 
@@ -581,6 +749,7 @@ end
 -- ============================================================
 function ENT:OnRemove()
     self:StopAllSounds()
+    self:StopManhackSystem()
     if IsValid(self.doorClosed) then self.doorClosed:Remove() end
     if IsValid(self.doorOpen)   then self.doorOpen:Remove() end
 end
