@@ -48,6 +48,8 @@ local MANHACK_BURST      = 2
 local MANHACK_INTERVAL   = 0.25
 local MANHACK_COUNT_INT  = 5
 local MANHACK_LAUNCH_SPD = 1200
+-- How long the door stays open after a burst before closing again.
+local DOOR_OPEN_TIME     = 1.5
 -- Local-space tail exit point. MI-12 faces +X at yaw=0 so tail = -X.
 local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)
 
@@ -195,7 +197,7 @@ local function FindNearestTarget(origin)
 end
 
 local function GetTailPos(heli)
-    local ang        = heli:GetAngles()
+    local ang = heli:GetAngles()
     local fwd, right, up = ang:Forward(), ang:Right(), ang:Up()
     local o = TAIL_LOCAL_OFFSET
     return heli:GetPos() + fwd * o.x + right * o.y + up * o.z
@@ -234,6 +236,10 @@ function ENT:ManhackBurst()
     local tailPos = GetTailPos(self)
     local target  = FindNearestTarget(tailPos)
     if not IsValid(target) then return end
+
+    -- Open the doors, spawn manhacks, then close doors after DOOR_OPEN_TIME.
+    self:OpenDoors()
+
     for i = 1, MANHACK_BURST do
         local spread = Vector(
             math.Rand(-30, 30),
@@ -242,6 +248,15 @@ function ENT:ManhackBurst()
         )
         LaunchManhack(tailPos + spread, target)
     end
+
+    -- Use a named timer so rapid bursts don't stack multiple close calls.
+    local closeTimer = "mi12_door_close_" .. self:EntIndex()
+    timer.Remove(closeTimer)
+    timer.Simple(DOOR_OPEN_TIME, function()
+        if IsValid(self) and not self.IsDestroyed then
+            self:CloseDoors()
+        end
+    end)
 end
 
 -- Starts the burst timer if it is not already running.
@@ -282,8 +297,6 @@ function ENT:StartManhackSystem()
     self.ManhackBurstName = "mi12_manhack_burst_" .. idx
     self.ManhackCountName = "mi12_manhack_count_" .. idx
 
-    -- Run the count check immediately, then every MANHACK_COUNT_INT seconds.
-    -- The count check itself decides whether to start or stop the burst timer.
     self:ManhackCountCheck()
     timer.Create(self.ManhackCountName, MANHACK_COUNT_INT, 0, function()
         if not IsValid(self) then
@@ -296,12 +309,9 @@ function ENT:StartManhackSystem()
 end
 
 function ENT:StopManhackSystem()
-    if self.ManhackBurstName then
-        timer.Remove(self.ManhackBurstName)
-    end
-    if self.ManhackCountName then
-        timer.Remove(self.ManhackCountName)
-    end
+    if self.ManhackBurstName then timer.Remove(self.ManhackBurstName) end
+    if self.ManhackCountName  then timer.Remove(self.ManhackCountName) end
+    timer.Remove("mi12_door_close_" .. self:EntIndex())
 end
 
 -- ============================================================
@@ -419,7 +429,7 @@ function ENT:Initialize()
     self:SpawnDoors()
     self:StartManhackSystem()
 
-    -- ── Engine sound (boosted) ──────────────────────────────
+    -- Engine sound
     self.EngineLoop = CreateSound(self, "tfre_mi12")
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(140)
@@ -454,10 +464,8 @@ end
 
 -- ============================================================
 --  DOORS
---  prop_physics loses position when parented in GMod because the
---  physics object fights SetParent. Use prop_dynamic instead:
---  it has no physics sim, follows the parent's bone transform
---  cleanly, and SetLocalPos/SetLocalAngles work reliably.
+--  prop_dynamic has no physics sim, follows SetParent cleanly.
+--  SetLocalPos/SetLocalAngles after SetParent locks attachment.
 -- ============================================================
 function ENT:SpawnDoors()
     local function MakeDoor(mdl, hidden)
@@ -472,27 +480,25 @@ function ENT:SpawnDoors()
         d:SetLocalPos(Vector(0, 0, 0))
         d:SetLocalAngles(Angle(0, 0, 0))
         d:SetNoDraw(hidden)
-        d:SetNotSolid(true)   -- doors are cosmetic only
+        d:SetNotSolid(true)
         return d
     end
-    -- Closed door visible at rest; open door hidden until opened.
-    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, false)
-    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   true)
+    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, false)  -- visible at rest
+    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   true)   -- hidden until burst
 end
 
--- Call this to swap door visuals (e.g. when dropping manhacks).
 function ENT:OpenDoors()
     if IsValid(self.doorClosed) then self.doorClosed:SetNoDraw(true)  end
-    if IsValid(self.doorOpen)   then self.doorOpen:SetNoDraw(false) end
+    if IsValid(self.doorOpen)   then self.doorOpen:SetNoDraw(false)   end
 end
 
 function ENT:CloseDoors()
     if IsValid(self.doorClosed) then self.doorClosed:SetNoDraw(false) end
-    if IsValid(self.doorOpen)   then self.doorOpen:SetNoDraw(true)  end
+    if IsValid(self.doorOpen)   then self.doorOpen:SetNoDraw(true)    end
 end
 
 -- ============================================================
---  Think — fade + NPC alerts + orbit movement + tumble
+--  Think
 -- ============================================================
 function ENT:Think()
     if not self.DieTime or not self.SpawnTime then
@@ -504,7 +510,6 @@ function ENT:Think()
     local dt = FrameTime()
     if dt <= 0 then dt = 0.01 end
 
-    -- Fade in / fade out
     local age  = ct - self.SpawnTime
     local left = self.DieTime - ct
     local alpha
@@ -517,7 +522,6 @@ function ENT:Think()
     end
     self:SetColor(Color(255, 255, 255, math.Round(alpha)))
 
-    -- NPC alert pulse
     if ct >= self.NextAlertTime then
         local plys = player.GetAll()
         for _, ent in ipairs(ents.GetAll()) do
@@ -532,7 +536,6 @@ function ENT:Think()
         self.NextAlertTime = ct + ALERT_INTERVAL
     end
 
-    -- Tumble mode
     if self.IsTumbling and not self.TumbleCrashed then
         local pos     = self:GetPos()
         local groundZ = self.TumbleGroundZ or -16384
@@ -557,7 +560,6 @@ function ENT:Think()
         return true
     end
 
-    -- Orbit flight
     local pos = self:GetPos()
 
     if ct >= self.AltDriftNextPick then
