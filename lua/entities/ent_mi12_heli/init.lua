@@ -146,25 +146,18 @@ end
 -- ============================================================
 --  DOOR SYSTEM
 --
---  Ported exactly from LFS init.lua (main branch).
+--  Visual animation: sequences baked into Mi12_Homer.mdl, played via
+--    self:ResetSequence(self:LookupSequence("Close")) — lowers the ramp (bay opens)
+--    self:ResetSequence(self:LookupSequence("Open"))  — raises the ramp (bay closes)
+--  LFS animation names are inverted relative to bay state.
 --
---  The VISUAL animation is a sequence on the helicopter model itself:
---    self:PlayAnimation("Close") — plays the ramp-lowering sequence (bay opens)
---    self:PlayAnimation("Open")  — plays the ramp-raising sequence (bay closes)
---  (LFS animation names are intentionally inverted relative to bay state.)
+--  doormdl (Door_Closed prop) = collision blocker for the lowered ramp floor.
+--  doormdl2 (Door_Open prop)  = always solid, never toggled.
 --
---  doormdl (Door_Closed prop) is purely a COLLISION BLOCKER for the ramp floor.
---  It is NOT the visual door. SetNoDraw is never used — only SetNotSolid.
---
---  doormdl2 (Door_Open prop) is always solid, always drawn, never toggled.
---
---  doornum semantics (matching LFS exactly):
---    doornum = 1  →  bay is CLOSED  (doormdl non-solid, ramp up, blocker off)
---    doornum = 0  →  bay is OPEN    (doormdl solid, ramp down, blocker on)
+--  DoorIsOpen = false → bay closed, doormdl non-solid (ramp up, no floor)
+--  DoorIsOpen = true  → bay open,   doormdl solid    (ramp down, floor present)
 -- ============================================================
 local function SpawnDoorProps(ent)
-    -- Door_Closed prop: collision blocker for the lowered ramp.
-    -- Starts non-solid (doornum=1, bay closed, ramp is up, no floor to block).
     local dc = ents.Create("prop_physics")
     dc:SetModel(DOOR_MDL_CLOSED)
     dc:SetPos(ent:GetPos())
@@ -172,10 +165,9 @@ local function SpawnDoorProps(ent)
     dc.DoNotDuplicate = true
     dc:SetParent(ent)
     dc:Spawn()
-    dc:SetNotSolid(true)    -- matches LFS SpawnFunction exactly
+    dc:SetNotSolid(true)    -- non-solid at spawn; matches LFS exactly
     ent.doormdl = dc
 
-    -- Door_Open prop: always solid, never touched again.
     local do2 = ents.Create("prop_physics")
     do2:SetModel(DOOR_MDL_OPEN)
     do2:SetPos(ent:GetPos())
@@ -202,9 +194,7 @@ end
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    -- Play the ramp-lowering sequence on the heli model (matches LFS PrimaryAttack "else" branch)
-    self:PlayAnimation("Close")
-    -- Collision blocker becomes solid now that the ramp floor is down
+    self:ResetSequence(self:LookupSequence("Close"))   -- lowers ramp visually
     if IsValid(self.doormdl) then self.doormdl:SetNotSolid(false) end
     BroadcastDoorEvent(self, true)
 end
@@ -212,9 +202,7 @@ end
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    -- Play the ramp-raising sequence on the heli model (matches LFS PrimaryAttack doornum==0 branch)
-    self:PlayAnimation("Open")
-    -- Remove collision blocker now that the ramp is up
+    self:ResetSequence(self:LookupSequence("Open"))    -- raises ramp visually
     if IsValid(self.doormdl) then self.doormdl:SetNotSolid(true) end
     BroadcastDoorEvent(self, false)
 end
@@ -397,7 +385,6 @@ function ENT:Initialize()
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- doornum=1 at spawn: bay closed, ramp up, collision blocker non-solid
     self.DoorIsOpen = false
     SpawnDoorProps(self)
 
