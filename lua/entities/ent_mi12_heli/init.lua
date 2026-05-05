@@ -144,20 +144,19 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR — exact LFS SpawnFunction / PrimaryAttack pattern
+--  DOOR — exact copy of LFS SpawnFunction + PrimaryAttack logic
 --
---  Two prop_physics are spawned and parented to the heli:
---    self.doormdl  = Door_Closed.mdl  → solid=true  at spawn (visible, blocking)
---    self.doormdl2 = Door_Open.mdl    → solid=false at spawn (hidden)
+--  LFS spawn state (doornum = 1 = visually closed):
+--    doormdl  (Door_Closed) SetNotSolid(true)  — non-solid, hidden
+--    doormdl2 (Door_Open)   SetNotSolid(false) — solid, always visible
 --
---  OpenDoors:  doormdl solid=false, doormdl2 solid=true  (matches LFS doornum==0 branch)
---  CloseDoors: doormdl solid=true,  doormdl2 solid=false (matches LFS else branch)
---
---  PlayAnimation("Open"/"Close") is an LFS vehicle base method that
---  does not exist on base_anim — omitted intentionally. The visual
---  swap IS the solidity toggle, which is what LFS does too.
+--  doormdl2 is NEVER touched again after spawn.
+--  Only doormdl toggles:
+--    OpenDoors  (doornum 1→0): doormdl SetNotSolid(true)  → Door_Closed hidden  → Door_Open shows
+--    CloseDoors (doornum 0→1): doormdl SetNotSolid(false) → Door_Closed visible → covers Door_Open
 -- ============================================================
 local function SpawnDoorProps(ent)
+    -- doormdl = Door_Closed, starts non-solid (hidden), matches LFS spawn
     local dc = ents.Create("prop_physics")
     dc:SetModel(DOOR_MDL_CLOSED)
     dc:SetPos(ent:GetPos())
@@ -165,9 +164,10 @@ local function SpawnDoorProps(ent)
     dc.DoNotDuplicate = true
     dc:SetParent(ent)
     dc:Spawn()
-    dc:SetNotSolid(false)   -- solid = closed door visible
+    dc:SetNotSolid(true)   -- non-solid at spawn, matches LFS
     ent.doormdl = dc
 
+    -- doormdl2 = Door_Open, starts solid, always visible, never touched again
     local do2 = ents.Create("prop_physics")
     do2:SetModel(DOOR_MDL_OPEN)
     do2:SetPos(ent:GetPos())
@@ -175,10 +175,10 @@ local function SpawnDoorProps(ent)
     do2.DoNotDuplicate = true
     do2:SetParent(ent)
     do2:Spawn()
-    do2:SetNotSolid(true)   -- non-solid = open door hidden
+    do2:SetNotSolid(false)  -- solid at spawn, stays this way forever
     ent.doormdl2 = do2
 
-    ent:CallOnRemove("RemoveDoorProps", function(e)
+    ent:CallOnRemove("RemoveDoorBlocker", function(e)
         if IsValid(e.doormdl)  then e.doormdl:Remove()  end
         if IsValid(e.doormdl2) then e.doormdl2:Remove() end
     end)
@@ -191,21 +191,25 @@ local function BroadcastDoorEvent(ent, isOpen)
     net.Broadcast()
 end
 
+-- doornum=1 = closed. OpenDoors = doornum 1→0 = LFS PrimaryAttack doornum==0 branch
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    -- LFS PrimaryAttack doornum==0 branch
-    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(true)   end
-    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(false)  end
+    -- LFS: self:PlayAnimation("Open") — omitted, LFS base only
+    -- LFS: self.doormdl:SetNotSolid(true) — Door_Closed already non-solid, no change needed
+    -- doormdl2 never touched. Door_Open was always showing. Nothing to do visually.
+    -- But we still call it to match doornum=0 state.
+    if IsValid(self.doormdl) then self.doormdl:SetNotSolid(true) end
     BroadcastDoorEvent(self, true)
 end
 
+-- CloseDoors = doornum 0→1 = LFS PrimaryAttack else branch
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    -- LFS PrimaryAttack else branch
-    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(false)  end
-    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(true)   end
+    -- LFS: self:PlayAnimation("Close") — omitted, LFS base only
+    -- LFS: self.doormdl:SetNotSolid(false) — Door_Closed becomes solid, covers Door_Open
+    if IsValid(self.doormdl) then self.doormdl:SetNotSolid(false) end
     BroadcastDoorEvent(self, false)
 end
 
@@ -313,9 +317,9 @@ function ENT:ManhackCountCheck()
 end
 
 function ENT:StartManhackSystem()
-    local idx          = self:EntIndex()
-    self.MhBurstTimer  = "mi12_mh_burst_" .. idx
-    self.MhCountTimer  = "mi12_mh_count_" .. idx
+    local idx         = self:EntIndex()
+    self.MhBurstTimer = "mi12_mh_burst_" .. idx
+    self.MhCountTimer = "mi12_mh_count_" .. idx
     timer.Simple(MANHACK_BURST_INTERVAL, function()
         if not IsValid(self) then return end
         self:ManhackCountCheck()
@@ -387,7 +391,7 @@ function ENT:Initialize()
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- Spawn door props exactly as LFS SpawnFunction does, doors start closed
+    -- Spawn door props, doornum=1 (closed) at start, matches LFS
     self.DoorIsOpen = false
     SpawnDoorProps(self)
 
@@ -678,5 +682,5 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
-    -- door props cleaned up by CallOnRemove("RemoveDoorProps")
+    -- door props removed by CallOnRemove("RemoveDoorBlocker")
 end
