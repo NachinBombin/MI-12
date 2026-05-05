@@ -86,29 +86,93 @@ local function SpawnBurstFX(ent, count, tier)
 end
 
 -- ============================================================
---  PARTICLE MANAGEMENT
+--  CONDENSATION CLOUD
+--  Fired on every door open AND close event.
+--  Uses only vanilla GMod particles — no custom PCF needed.
+--
+--  Strategy: 6 overlapping smoke puffs scattered around the
+--  tail opening, each launched with a slight upward + backward
+--  velocity to billow away from the fuselage. White color.
 -- ============================================================
-local function StopParticles(state)
-    if not state.particles then return end
-    for _, p in ipairs(state.particles) do
-        if IsValid(p) then p:StopEmission() end
+local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)   -- must match init.lua
+local CLOUD_PUFF_COUNT   = 6     -- overlapping puffs per event
+local CLOUD_SPREAD_XY    = 55    -- horizontal scatter radius (HU)
+local CLOUD_SPREAD_Z     = 30    -- vertical scatter radius (HU)
+
+local function EmitCondensationCloud(ent)
+    if not IsValid(ent) then return end
+
+    local pos = ent:GetPos()
+    local ang = ent:GetAngles()
+
+    -- Compute world-space tail anchor
+    local tailW = LocalToWorld(TAIL_LOCAL_OFFSET, Angle(0, 0, 0), pos, ang)
+
+    -- Velocity of the heli in world space (forward direction * speed).
+    -- We can approximate it from the entity's forward vector.
+    -- Puffs are launched slightly backward + up relative to heading
+    -- so they don't clip through the fuselage.
+    local heliForward = ang:Forward()
+
+    for _ = 1, CLOUD_PUFF_COUNT do
+        local scatter = Vector(
+            math.Rand(-CLOUD_SPREAD_XY, CLOUD_SPREAD_XY),
+            math.Rand(-CLOUD_SPREAD_XY, CLOUD_SPREAD_XY),
+            math.Rand(0, CLOUD_SPREAD_Z)
+        )
+        local puffPos = tailW + scatter
+
+        -- Particle: "particle_smoke" — white, fat, slow-rising, no custom PCF.
+        local emitter = ParticleEmitter(puffPos)
+        if not emitter then continue end
+
+        -- Emit 3 particles per scatter point for density
+        for _ = 1, 3 do
+            local p = emitter:Add("particle/particle_smokegrenade", puffPos
+                + Vector(math.Rand(-15,15), math.Rand(-15,15), math.Rand(-8,8)))
+            if p then
+                -- Pure white, full alpha, fades to transparent
+                p:SetColor(240, 240, 240)
+                p:SetAlpha(220)
+                p:SetDieTime(math.Rand(1.2, 2.2))
+                p:SetStartAlpha(200)
+                p:SetEndAlpha(0)
+                p:SetStartSize(math.Rand(60, 110))
+                p:SetEndSize(math.Rand(180, 280))
+                p:SetRoll(math.Rand(0, 360))
+                p:SetRollDelta(math.Rand(-0.8, 0.8))
+                -- Drift backward away from heli heading + upward
+                local vel = (heliForward * -80)
+                    + Vector(
+                        math.Rand(-40, 40),
+                        math.Rand(-40, 40),
+                        math.Rand(30, 90)
+                    )
+                p:SetVelocity(vel)
+                p:SetGravity(Vector(0, 0, 12))  -- gentle upward gravity override
+                p:SetAirResistance(140)
+                p:SetCollide(false)
+                p:SetBounce(0)
+            end
+        end
+
+        emitter:Finish()
     end
-    state.particles = {}
 end
 
-local function ApplyFlameParticles(ent, state, tier)
-    StopParticles(state)
-    state.tier = tier
-    if not IsValid(ent) or tier == 0 then return end
-    for _, off in ipairs(TIER_OFFSETS[tier]) do
-        local p = ent:CreateParticleEffect("fire_medium_02", PATTACH_ABSORIGIN_FOLLOW, 0)
-        if IsValid(p) then
-            p:SetControlPoint(0, ent:LocalToWorld(off))
-            table.insert(state.particles, p)
-        end
-    end
-    state.nextBurst = CurTime() + (TIER_BURST_DELAY[tier] or 4)
-end
+-- ============================================================
+--  NET — door event
+-- ============================================================
+net.Receive("MI12_DoorEvent", function()
+    local ent    = net.ReadEntity()
+    local isOpen = net.ReadBool()
+    -- Fire cloud on BOTH open and close transitions.
+    -- On open: burst puffs outward (door unsealing pressurized bay).
+    -- On close: smaller puff as bay re-pressurizes.
+    -- We use the same function both ways; the close puff is
+    -- naturally smaller because the entity velocity has shifted.
+    EmitCondensationCloud(ent)
+ end)
 
 -- ============================================================
 --  NET — damage tier broadcast
@@ -136,6 +200,31 @@ net.Receive("bombin_mi12_damage_tier", function()
         state.pendingApply = true
     end
 end)
+
+-- ============================================================
+--  PARTICLE MANAGEMENT
+-- ============================================================
+local function StopParticles(state)
+    if not state.particles then return end
+    for _, p in ipairs(state.particles) do
+        if IsValid(p) then p:StopEmission() end
+    end
+    state.particles = {}
+end
+
+local function ApplyFlameParticles(ent, state, tier)
+    StopParticles(state)
+    state.tier = tier
+    if not IsValid(ent) or tier == 0 then return end
+    for _, off in ipairs(TIER_OFFSETS[tier]) do
+        local p = ent:CreateParticleEffect("fire_medium_02", PATTACH_ABSORIGIN_FOLLOW, 0)
+        if IsValid(p) then
+            p:SetControlPoint(0, ent:LocalToWorld(off))
+            table.insert(state.particles, p)
+        end
+    end
+    state.nextBurst = CurTime() + (TIER_BURST_DELAY[tier] or 4)
+end
 
 -- ============================================================
 --  THINK — particle CP updates + burst scheduling
@@ -173,29 +262,21 @@ end)
 
 -- ============================================================
 --  ROTOR ANIMATION
---  RPM is locked to ENT.LimitRPM (3000) at all times.
---  Bone indices verified from LFS Mi-12 cl_init.lua.
 -- ============================================================
 local RPM_FULL  = ENT.LimitRPM or 3000
 local RPM_MAX   = ENT.LimitRPM or 3000
 
--- At 100% RPM:
---   Bend1 = math.Remap(3000, 0, 3000, 0, 10) = 10
---   Bend2 = math.Remap(3000, 0, 3000, 0,  4) = 4
---   Bend3 (droop) = math.Remap(3000, 0, 3000, 55, 0) = 0
-local BEND1  = math.Remap(RPM_FULL, 0, RPM_MAX, 0, 10)   -- = 10
-local BEND2  = math.Remap(RPM_FULL, 0, RPM_MAX, 0,  4)   -- = 4
-local DROOP  = math.Remap(RPM_FULL, 0, RPM_MAX, 55, 0)   -- = 0
+local BEND1  = math.Remap(RPM_FULL, 0, RPM_MAX, 0, 10)
+local BEND2  = math.Remap(RPM_FULL, 0, RPM_MAX, 0,  4)
+local DROOP  = math.Remap(RPM_FULL, 0, RPM_MAX, 55, 0)
 
-local RotorAcc = {}   -- [entIndex] = accumulated rotor angle (for pose param)
+local RotorAcc = {}
 
 local function AnimRotor(ent, idx)
     if not IsValid(ent) then return end
 
     RotorAcc[idx] = (RotorAcc[idx] or 0) + RPM_FULL * FrameTime() * 1.5
 
-    -- Rotor A — 10 blade arm bones (33–42)
-    -- Alternating: odd = BEND1, even = BEND2
     ent:ManipulateBoneAngles(33, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(34, Angle(0, 0, BEND2))
     ent:ManipulateBoneAngles(35, Angle(0, 0, BEND1))
@@ -207,7 +288,6 @@ local function AnimRotor(ent, idx)
     ent:ManipulateBoneAngles(41, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(42, Angle(0, 0, BEND2))
 
-    -- Rotor B — 10 blade arm bones (45–54)
     ent:ManipulateBoneAngles(45, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(46, Angle(0, 0, BEND2))
     ent:ManipulateBoneAngles(47, Angle(0, 0, BEND1))
@@ -219,15 +299,12 @@ local function AnimRotor(ent, idx)
     ent:ManipulateBoneAngles(53, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(54, Angle(0, 0, BEND2))
 
-    -- Hub droop arms (bones 12, 13) — 0 at full RPM
     ent:ManipulateBoneAngles(12, Angle( DROOP, 0, 0))
     ent:ManipulateBoneAngles(13, Angle(-DROOP, 0, 0))
 
-    -- Bodygroups: always full-RPM blur disc
     ent:SetBodygroup(2, 1)
     ent:SetBodygroup(3, 1)
 
-    -- Drive rotor spin pose parameter
     ent:SetPoseParameter("rotor_spin", RotorAcc[idx])
     ent:InvalidateBoneCache()
 end

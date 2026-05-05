@@ -9,6 +9,7 @@ AddCSLuaFile("cl_trailsystem.lua")
 include("shared.lua")
 
 util.AddNetworkString("bombin_mi12_damage_tier")
+util.AddNetworkString("MI12_DoorEvent")  -- new: door open/close puff
 
 -- ============================================================
 --  CACHED CONSTANTS  (from shared.lua)
@@ -40,25 +41,13 @@ local TWO_PI              = math.pi * 2
 
 -- ============================================================
 --  MANHACK ABILITY CONSTANTS
---
---  Root cause of "doors always open":
---    Old MANHACK_INTERVAL = 0.25s  (burst every 250ms)
---    Old DOOR_OPEN_TIME   = 1.5s   (close timer)
---    => Door opened 6x before the close timer fired once.
---       The close timer was always being cancelled/reset.
---
---  Fix:
---    MANHACK_BURST_INTERVAL = 5s   (one burst event every 5 seconds)
---    DOOR_OPEN_TIME         = 2.0s (door stays open for the burst window)
---    Within each burst event we fire MANHACK_BURST manhacks
---    in rapid succession via a one-shot loop, no repeating timer.
 -- ============================================================
 local MANHACK_CAP            = 20
-local MANHACK_BURST          = 3     -- manhacks per burst event
-local MANHACK_BURST_INTERVAL = 5.0   -- seconds between burst events
-local MANHACK_COUNT_INT      = 8     -- cap re-check interval
+local MANHACK_BURST          = 3
+local MANHACK_BURST_INTERVAL = 5.0
+local MANHACK_COUNT_INT      = 8
 local MANHACK_LAUNCH_SPD     = 1200
-local DOOR_OPEN_TIME         = 2.0   -- door stays open this long after a burst
+local DOOR_OPEN_TIME         = 2.0
 local TAIL_LOCAL_OFFSET      = Vector(-700, 0, -60)
 
 -- ============================================================
@@ -157,14 +146,23 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR  —  bodygroup helpers
+--  DOOR  —  bodygroup + condensation cloud net broadcast
 -- ============================================================
+local function BroadcastDoorEvent(ent, isOpen)
+    net.Start("MI12_DoorEvent")
+        net.WriteEntity(ent)
+        net.WriteBool(isOpen)
+    net.Broadcast()
+end
+
 function ENT:OpenDoors()
     self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_OPEN)
+    BroadcastDoorEvent(self, true)
 end
 
 function ENT:CloseDoors()
     self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
+    BroadcastDoorEvent(self, false)
 end
 
 -- ============================================================
@@ -227,16 +225,11 @@ local function LaunchManhack(spawnPos, target)
     end
 end
 
---
---  ManhackBurst: fires MANHACK_BURST manhacks, opens the door,
---  then schedules ONE close. No repeating timer inside this function.
---  The repeating timer (MhBurstTimer) calls this every MANHACK_BURST_INTERVAL.
---
 function ENT:ManhackBurst()
     if self.IsDestroyed then return end
     local tailPos = GetTailPos(self)
     local target  = FindNearestTarget(tailPos)
-    if not IsValid(target) then return end  -- no target -> door stays closed
+    if not IsValid(target) then return end
 
     self:OpenDoors()
 
@@ -247,21 +240,15 @@ function ENT:ManhackBurst()
         )
     end
 
-    -- One authoritative close timer per entity. Remove old one first so we
-    -- never have two timers fighting over the bodygroup state.
     local closeKey = "mi12_door_close_" .. self:EntIndex()
     timer.Remove(closeKey)
     timer.Simple(DOOR_OPEN_TIME, function()
-        if IsValid(self) and not self.IsDestroyed then
-            self:CloseDoors()
-        end
+        if IsValid(self) and not self.IsDestroyed then self:CloseDoors() end
     end)
 end
 
 function ENT:ManhackBurstStart()
     if timer.Exists(self.MhBurstTimer) then return end
-    -- Create the repeating timer that fires one burst event at a time.
-    -- Between events the door is closed (DOOR_OPEN_TIME < MANHACK_BURST_INTERVAL).
     timer.Create(self.MhBurstTimer, MANHACK_BURST_INTERVAL, 0, function()
         if not IsValid(self) then timer.Remove(self.MhBurstTimer); return end
         self:ManhackBurst()
@@ -270,7 +257,6 @@ end
 
 function ENT:ManhackBurstStop()
     timer.Remove(self.MhBurstTimer)
-    -- Force door closed when we stop dropping manhacks.
     if IsValid(self) then self:CloseDoors() end
 end
 
@@ -287,8 +273,6 @@ function ENT:StartManhackSystem()
     local idx          = self:EntIndex()
     self.MhBurstTimer  = "mi12_mh_burst_" .. idx
     self.MhCountTimer  = "mi12_mh_count_" .. idx
-    -- Delay the first check by one full interval so the heli has time to
-    -- fade in and reach orbit before dropping manhacks on spawn.
     timer.Simple(MANHACK_BURST_INTERVAL, function()
         if not IsValid(self) then return end
         self:ManhackCountCheck()
@@ -307,7 +291,6 @@ function ENT:StopManhackSystem()
     if self.MhBurstTimer then timer.Remove(self.MhBurstTimer) end
     if self.MhCountTimer  then timer.Remove(self.MhCountTimer) end
     timer.Remove("mi12_door_close_" .. self:EntIndex())
-    -- Ensure door is closed on cleanup regardless of state.
     if IsValid(self) then self:CloseDoors() end
 end
 
@@ -358,7 +341,6 @@ function ENT:Initialize()
     self:SetColor(Color(255,255,255,0))
     self:SetHealth(MAX_HP)
 
-    -- Door starts CLOSED. Bodygroups 2 and 3 = rotor blur discs on.
     self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
