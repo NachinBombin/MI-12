@@ -14,8 +14,6 @@ util.AddNetworkString("bombin_mi12_damage_tier")
 --  CACHE SHARED CONSTANTS
 -- ============================================================
 local MODEL_PATH      = ENT.ModelPath
-local DOOR_MDL_CLOSED = ENT.DoorModelClosed
-local DOOR_MDL_OPEN   = ENT.DoorModelOpen
 local GIB_MODELS      = ENT.GibModels
 local MAX_HP          = ENT.MaxHP
 local FADE_DURATION   = ENT.FadeDuration
@@ -33,7 +31,7 @@ local PASS_SOUND_B = "vehicles/apc/apc_idle1.wav"
 local MODEL_YAW_OFFSET    = 0
 local ROLL_SUSTAINED_GAIN = 1.8
 local ROLL_TRANSIENT_GAIN = 45.0
-local ROLL_MAX            = 33.0
+local ROLL_MAX            = 18.0
 local ROLL_LERP_IN        = 0.06
 local ROLL_LERP_OUT       = 0.01
 local GIB_LIFETIME        = 40
@@ -45,13 +43,18 @@ local TWO_PI = math.pi * 2
 -- ============================================================
 local MANHACK_CAP        = 20
 local MANHACK_BURST      = 2
-local MANHACK_INTERVAL   = 0.5
+local MANHACK_INTERVAL   = 0.25
 local MANHACK_COUNT_INT  = 5
 local MANHACK_LAUNCH_SPD = 1200
--- How long the door stays open after a burst before closing again.
-local DOOR_OPEN_TIME     = 4.5
--- Local-space tail exit point. MI-12 faces +X at yaw=0 so tail = -X.
+local DOOR_OPEN_TIME     = 1.5
 local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)
+
+-- ─── Door bodygroup ───────────────────────────────────────────────────────────
+--  The Mi-12 Homer model bakes the door into bodygroup index 1.
+--  Value 0 = closed (default).  Value 1 = open.
+local DOOR_BG_INDEX  = 1
+local DOOR_BG_CLOSED = 0
+local DOOR_BG_OPEN   = 1
 
 -- ============================================================
 --  HELPERS
@@ -166,9 +169,19 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
+--  DOOR  (bodygroup on the main model — no separate props needed)
+-- ============================================================
+function ENT:OpenDoors()
+    self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_OPEN)
+end
+
+function ENT:CloseDoors()
+    self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
+end
+
+-- ============================================================
 --  MANHACK ABILITY
 -- ============================================================
-
 local function FindNearestTarget(origin)
     local bestDistSq = math.huge
     local bestEnt    = nil
@@ -237,7 +250,6 @@ function ENT:ManhackBurst()
     local target  = FindNearestTarget(tailPos)
     if not IsValid(target) then return end
 
-    -- Open the doors, spawn manhacks, then close doors after DOOR_OPEN_TIME.
     self:OpenDoors()
 
     for i = 1, MANHACK_BURST do
@@ -249,7 +261,6 @@ function ENT:ManhackBurst()
         LaunchManhack(tailPos + spread, target)
     end
 
-    -- Use a named timer so rapid bursts don't stack multiple close calls.
     local closeTimer = "mi12_door_close_" .. self:EntIndex()
     timer.Remove(closeTimer)
     timer.Simple(DOOR_OPEN_TIME, function()
@@ -259,7 +270,6 @@ function ENT:ManhackBurst()
     end)
 end
 
--- Starts the burst timer if it is not already running.
 function ENT:ManhackBurstStart()
     if timer.Exists(self.ManhackBurstName) then return end
     timer.Create(self.ManhackBurstName, MANHACK_INTERVAL, 0, function()
@@ -271,16 +281,12 @@ function ENT:ManhackBurstStart()
     end)
 end
 
--- Stops the burst timer if it is running.
 function ENT:ManhackBurstStop()
     if timer.Exists(self.ManhackBurstName) then
         timer.Remove(self.ManhackBurstName)
     end
 end
 
--- Called every MANHACK_COUNT_INT seconds.
--- If live manhack count < cap: ensure burst timer is running.
--- If count >= cap: stop burst timer and wait for next check.
 function ENT:ManhackCountCheck()
     if not IsValid(self) then return end
     if self.IsDestroyed    then return end
@@ -422,14 +428,14 @@ function ENT:Initialize()
     self.TumbleVelocity    = Vector(0, 0, 0)
     self.TumbleAngVelocity = Vector(0, 0, 0)
 
-    self:SetBodygroup(1, 0)
+    -- Bodygroups: door closed at spawn, rotors at full-RPM blur disc
+    self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    self:SpawnDoors()
     self:StartManhackSystem()
 
-    -- Engine sound
+    -- Engine sounds
     self.EngineLoop = CreateSound(self, "tfre_mi12")
     if self.EngineLoop then
         self.EngineLoop:SetSoundLevel(140)
@@ -460,41 +466,6 @@ function ENT:Initialize()
     end)
 
     self:NextThink(CurTime())
-end
-
--- ============================================================
---  DOORS
---  prop_dynamic has no physics sim, follows SetParent cleanly.
---  SetLocalPos/SetLocalAngles after SetParent locks attachment.
--- ============================================================
-function ENT:SpawnDoors()
-    local function MakeDoor(mdl, hidden)
-        local d = ents.Create("prop_dynamic")
-        if not IsValid(d) then return nil end
-        d:SetModel(mdl)
-        d:SetPos(self:GetPos())
-        d:SetAngles(self:GetAngles())
-        d:Spawn()
-        d:Activate()
-        d:SetParent(self)
-        d:SetLocalPos(Vector(0, 0, 0))
-        d:SetLocalAngles(Angle(0, 0, 0))
-        d:SetNoDraw(hidden)
-        d:SetNotSolid(true)
-        return d
-    end
-    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, false)  -- visible at rest
-    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   true)   -- hidden until burst
-end
-
-function ENT:OpenDoors()
-    if IsValid(self.doorClosed) then self.doorClosed:SetNoDraw(true)  end
-    if IsValid(self.doorOpen)   then self.doorOpen:SetNoDraw(false)   end
-end
-
-function ENT:CloseDoors()
-    if IsValid(self.doorClosed) then self.doorClosed:SetNoDraw(false) end
-    if IsValid(self.doorOpen)   then self.doorOpen:SetNoDraw(true)    end
 end
 
 -- ============================================================
@@ -712,15 +683,9 @@ end
 function ENT:DestroyHeli()
     if self.IsDestroyed then return end
     self.IsDestroyed = true
-
     self:StopManhackSystem()
-
-    if IsValid(self.doorClosed) then self.doorClosed:Remove() end
-    if IsValid(self.doorOpen)   then self.doorOpen:Remove() end
-
     self:FadeAndStopSounds(0.3)
     self:StartTumble()
-
     timer.Simple(12, function()
         if IsValid(self) then self:CrashExplode() end
     end)
@@ -757,6 +722,4 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
-    if IsValid(self.doorClosed) then self.doorClosed:Remove() end
-    if IsValid(self.doorOpen)   then self.doorOpen:Remove() end
 end
