@@ -24,7 +24,6 @@ if SERVER then
     local cv_height   = CreateConVar("npc_mi12_height",   "5000", F, "Height above ground (HU).")
     local cv_debug    = CreateConVar("npc_mi12_announce", "0",    F, "Enable debug prints.")
 
-    -- NPC classes that can call in the MI-12
     local CALLERS = {
         ["npc_combine_s"]     = true,
         ["npc_metropolice"]   = true,
@@ -56,8 +55,8 @@ if SERVER then
 
     -- ─── Flare ──────────────────────────────────────────────
     local function ThrowFlare(npc, targetPos)
-        local eyePos  = npc:EyePos()
-        local dir     = (targetPos - eyePos):GetNormalized()
+        local eyePos = npc:EyePos()
+        local dir    = (targetPos - eyePos):GetNormalized()
 
         local flare = ents.Create("ent_bombin_flare_blue")
         if not IsValid(flare) then
@@ -85,32 +84,40 @@ if SERVER then
         net.WriteEntity(flare)
         net.Broadcast()
 
-        Dbg("Flare deployed successfully")
+        Dbg("Flare deployed")
         return flare
     end
 
-    -- ─── Heli spawn ──────────────────────────────────────────
+    -- ─── Heli spawn ─────────────────────────────────────────
+    --  IMPORTANT: base_anim has no SetVar/GetVar (those are LFS-only).
+    --  We pass parameters via entity.SpawnParams before Spawn().
+    --  init.lua reads them with ReadParam() in ENT:Initialize().
     local function SpawnHeliAt(centerPos)
         if not scripted_ents.GetStored("ent_mi12_heli") then
-            Dbg("ent_mi12_heli is not a registered scripted entity")
+            Dbg("ent_mi12_heli is not registered")
             return false
         end
 
         local heli = ents.Create("ent_mi12_heli")
         if not IsValid(heli) then
-            Dbg("ents.Create returned invalid entity")
+            Dbg("ents.Create returned invalid")
             return false
         end
 
         local dir = RandomFlatDir()
+
+        -- Set params on the table BEFORE Spawn() so Initialize() can read them.
+        heli.SpawnParams = {
+            CenterPos    = centerPos,
+            CallDir      = dir,
+            Lifetime     = cv_life:GetFloat(),
+            Speed        = cv_speed:GetFloat(),
+            OrbitRadius  = cv_radius:GetFloat(),
+            SkyHeightAdd = cv_height:GetFloat(),
+        }
+
         heli:SetPos(centerPos)
         heli:SetAngles(dir:Angle())
-        heli:SetVar("CenterPos",    centerPos)
-        heli:SetVar("CallDir",      dir)
-        heli:SetVar("Lifetime",     cv_life:GetFloat())
-        heli:SetVar("Speed",        cv_speed:GetFloat())
-        heli:SetVar("OrbitRadius",  cv_radius:GetFloat())
-        heli:SetVar("SkyHeightAdd", cv_height:GetFloat())
         heli:Spawn()
         heli:Activate()
 
@@ -123,43 +130,14 @@ if SERVER then
         return true
     end
 
-    -- ─── Full call sequence ──────────────────────────────────
-    local function CallMI12(npc, target)
-        if not IsValid(npc) then return false end
-        if not IsValid(target) or not target:IsPlayer() or not target:Alive() then return false end
-
-        local targetPos = target:GetPos() + Vector(0, 0, 36)
-
-        if not CheckOpenSky(targetPos) then
-            Dbg("Rejected: no open sky above target")
-            return false
-        end
-
-        local flare = ThrowFlare(npc, targetPos)
-        if not IsValid(flare) then return false end
-
-        local fallback = Vector(targetPos.x, targetPos.y, targetPos.z)
-        Dbg("Flare out, waiting " .. cv_delay:GetFloat() .. "s")
-
-        timer.Simple(cv_delay:GetFloat(), function()
-            local spawnPos = IsValid(flare) and flare:GetPos() or fallback
-            SpawnHeliAt(spawnPos)
-        end)
-
-        return true
-    end
-
-    -- ─── Manual spawn via Q-menu button ─────────────────────
+    -- ─── Manual spawn via Q-menu ─────────────────────────────
     net.Receive("MI12_ManualSpawn", function(_, ply)
         if not IsValid(ply) then return end
         SpawnHeliAt(ply:EyePos())
         Dbg("Manual spawn by " .. ply:Nick())
     end)
 
-    -- ─── NPC trigger loop ─────────────────────────────────────
-    -- NOTE: we do NOT feed the player's position to NPCs.
-    -- The MI-12 simply orbits and does not perform any attack.
-    -- The loop only handles whether to call the heli in at all.
+    -- ─── NPC trigger loop ────────────────────────────────────
     timer.Create("MI12_Think", 0.5, 0, function()
         if not cv_enabled:GetBool() then return end
 
@@ -196,6 +174,32 @@ if SERVER then
             end
         end
     end)
+
+    -- ─── Full call sequence ──────────────────────────────────
+    function CallMI12(npc, target)
+        if not IsValid(npc) then return false end
+        if not IsValid(target) or not target:IsPlayer() or not target:Alive() then return false end
+
+        local targetPos = target:GetPos() + Vector(0, 0, 36)
+
+        if not CheckOpenSky(targetPos) then
+            Dbg("Rejected: no open sky")
+            return false
+        end
+
+        local flare = ThrowFlare(npc, targetPos)
+        if not IsValid(flare) then return false end
+
+        local fallback = Vector(targetPos.x, targetPos.y, targetPos.z)
+        Dbg("Flare out, waiting " .. cv_delay:GetFloat() .. "s")
+
+        timer.Simple(cv_delay:GetFloat(), function()
+            local spawnPos = IsValid(flare) and flare:GetPos() or fallback
+            SpawnHeliAt(spawnPos)
+        end)
+
+        return true
+    end
 end
 
 -- ─── CLIENT ─────────────────────────────────────────────────
@@ -209,7 +213,6 @@ if CLIENT then
         end
     end)
 
-    -- Blue dynamic light on the flare (same language as AN-71)
     hook.Add("Think", "MI12_FlareLight", function()
         for idx, flare in pairs(activeFlares) do
             if not IsValid(flare) then
