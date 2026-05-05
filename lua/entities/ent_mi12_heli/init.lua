@@ -24,19 +24,17 @@ local JITTER_AMP      = ENT.JitterAmplitude
 local ALERT_INTERVAL  = ENT.AlertInterval
 
 -- ============================================================
---  DOOR BODYGROUP
---  mi12_door_bg_index lets you test different indices live
---  without restarting the server. Default = 1 (from shared.lua).
---  Change with: "mi12_door_bg_index 0" in server console,
---  then respawn the heli.
+--  DOOR PROP MODELS
+--  Copied directly from the original LFS MI-12 init.lua.
+--  Two separate props are parented to the helicopter at spawn.
+--  OpenDoors  → shows Mi12_Homer_Door_Open,   hides Closed.
+--  CloseDoors → shows Mi12_Homer_Door_Closed,  hides Open.
+--  Solidity is used to "show" (non-solid = invisible to physics
+--  but still rendered) — we also toggle Draw on each prop so
+--  only the correct model is visible at any time.
 -- ============================================================
-local CV_DOOR_INDEX = CreateConVar("mi12_door_bg_index", tostring(ENT.DoorBodygroupIndex),
-    FCVAR_NOTIFY, "Bodygroup index that controls the MI-12 cargo doors. Test 0-4.")
-
-local DOOR_BG_OPEN   = ENT.DoorBodygroupOpen    -- 1
-local DOOR_BG_CLOSED = ENT.DoorBodygroupClose   -- 0
-
-local function DoorBGIndex() return CV_DOOR_INDEX:GetInt() end
+local DOOR_MDL_CLOSED = "models/tfre/vehicles/Mi12_Homer_Door_Closed.mdl"
+local DOOR_MDL_OPEN   = "models/tfre/vehicles/Mi12_Homer_Door_Open.mdl"
 
 -- ============================================================
 --  FLIGHT CONSTANTS
@@ -157,7 +155,39 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR — bodygroup toggle + net broadcast
+--  DOOR PROP HELPERS
+--  Spawns both door props parented to the heli.
+--  Same pattern as the original LFS SpawnFunction.
+-- ============================================================
+local function SpawnDoorProps(ent)
+    -- Closed door prop — visible at start
+    local dc = ents.Create("prop_dynamic")
+    dc:SetModel(DOOR_MDL_CLOSED)
+    dc:SetPos(ent:GetPos())
+    dc:SetAngles(ent:GetAngles())
+    dc.DoNotDuplicate = true
+    dc:SetParent(ent)
+    dc:Spawn()
+    dc:SetNotSolid(true)  -- parented props should not have physics collisions
+    dc:DrawShadow(false)
+    ent.DoorClosed = dc
+
+    -- Open door prop — hidden at start
+    local do_ = ents.Create("prop_dynamic")
+    do_:SetModel(DOOR_MDL_OPEN)
+    do_:SetPos(ent:GetPos())
+    do_:SetAngles(ent:GetAngles())
+    do_.DoNotDuplicate = true
+    do_:SetParent(ent)
+    do_:Spawn()
+    do_:SetNotSolid(true)
+    do_:DrawShadow(false)
+    do_:SetNoDraw(true)   -- start hidden
+    ent.DoorOpen = do_
+end
+
+-- ============================================================
+--  DOOR — swap prop visibility + play animation + net broadcast
 -- ============================================================
 local function BroadcastDoorEvent(ent, isOpen)
     net.Start("MI12_DoorEvent")
@@ -167,17 +197,32 @@ local function BroadcastDoorEvent(ent, isOpen)
 end
 
 function ENT:OpenDoors()
-    local idx = DoorBGIndex()
-    self:SetBodygroup(idx, DOOR_BG_OPEN)
-    print(string.format("[MI-12] OpenDoors  → SetBodygroup(%d, %d)", idx, DOOR_BG_OPEN))
+    if self.DoorIsOpen then return end
+    self.DoorIsOpen = true
+    -- Swap props: hide closed, show open
+    if IsValid(self.DoorClosed) then self.DoorClosed:SetNoDraw(true)  end
+    if IsValid(self.DoorOpen)   then self.DoorOpen:SetNoDraw(false)   end
+    -- Play the "Open" animation on the heli itself (same as LFS original)
+    self:PlayAnimation("Open")
     BroadcastDoorEvent(self, true)
 end
 
 function ENT:CloseDoors()
-    local idx = DoorBGIndex()
-    self:SetBodygroup(idx, DOOR_BG_CLOSED)
-    print(string.format("[MI-12] CloseDoors → SetBodygroup(%d, %d)", idx, DOOR_BG_CLOSED))
+    if not self.DoorIsOpen then return end
+    self.DoorIsOpen = false
+    -- Swap props: show closed, hide open
+    if IsValid(self.DoorClosed) then self.DoorClosed:SetNoDraw(false) end
+    if IsValid(self.DoorOpen)   then self.DoorOpen:SetNoDraw(true)    end
+    -- Play the "Close" animation on the heli itself
+    self:PlayAnimation("Close")
     BroadcastDoorEvent(self, false)
+end
+
+function ENT:RemoveDoorProps()
+    if IsValid(self.DoorClosed) then self.DoorClosed:Remove() end
+    if IsValid(self.DoorOpen)   then self.DoorOpen:Remove()   end
+    self.DoorClosed = nil
+    self.DoorOpen   = nil
 end
 
 -- ============================================================
@@ -356,34 +401,14 @@ function ENT:Initialize()
     self:SetColor(Color(255,255,255,0))
     self:SetHealth(MAX_HP)
 
-    -- --------------------------------------------------------
-    --  Print all bodygroups so we can verify the door index.
-    --  Check server console after spawning the heli.
-    -- --------------------------------------------------------
-    local bgCount = self:GetNumBodyGroups()
-    print(string.format("[MI-12] Model has %d bodygroup(s):", bgCount))
-    for i = 0, bgCount - 1 do
-        print(string.format("  bg[%d] name=%-20s subcount=%d",
-            i,
-            self:GetBodygroupName(i),
-            self:GetBodygroupCount(i)
-        ))
-    end
-    print(string.format("[MI-12] Door will use bg[%d] (mi12_door_bg_index). open=%d closed=%d",
-        DoorBGIndex(), DOOR_BG_OPEN, DOOR_BG_CLOSED))
+    -- Rotor blur bodygroups (2 and 3 confirmed from model dump)
+    self:SetBodygroup(2, 1)
+    self:SetBodygroup(3, 1)
 
-    -- Close doors at spawn (correct index via convar)
-    self:SetBodygroup(DoorBGIndex(), DOOR_BG_CLOSED)
-
-    -- --------------------------------------------------------
-    --  Bodygroups 2 and 3 are for rotor blur meshes on this
-    --  model (confirmed from cl_init bone list). Set them to
-    --  submodel 1 (blur on) at spawn.
-    --  NOTE: if the door turns out to be bg 2 or 3, remove
-    --  these lines and update DoorBodygroupIndex in shared.lua.
-    -- --------------------------------------------------------
-    if DoorBGIndex() ~= 2 then self:SetBodygroup(2, 1) end
-    if DoorBGIndex() ~= 3 then self:SetBodygroup(3, 1) end
+    -- Spawn the two door props parented to this entity.
+    -- Door starts closed (DoorOpen prop is hidden via SetNoDraw).
+    self.DoorIsOpen = false
+    SpawnDoorProps(self)
 
     local orbitDir = (math.random(2) == 1) and 1 or -1
     local right    = Vector(-dir.y, dir.x, 0)
@@ -640,6 +665,7 @@ function ENT:DestroyHeli()
     self.IsDestroyed = true
     self:StopManhackSystem()
     self:FadeAndStopSounds(0.3)
+    self:RemoveDoorProps()
     self:StartTumble()
     timer.Simple(12, function() if IsValid(self) then self:CrashExplode() end end)
 end
@@ -672,4 +698,5 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
+    self:RemoveDoorProps()
 end
