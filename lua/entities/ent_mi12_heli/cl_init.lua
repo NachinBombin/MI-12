@@ -10,27 +10,14 @@ game.AddParticles("particles/fire_01.pcf")
 PrecacheParticleSystem("fire_medium_02")
 
 -- ============================================================
---  DAMAGE TIER FIRE OFFSETS  (model-local, X=right, Y=fwd, Z=up)
+--  DAMAGE TIER FIRE OFFSETS
 -- ============================================================
 local TIER_OFFSETS = {
-    [1] = {
-        Vector(0, 0, 60),
-    },
-    [2] = {
-        Vector(0,    0,  60),
-        Vector( 110,  0,  20),
-        Vector(-110,  0,  20),
-    },
-    [3] = {
-        Vector(0,    0,  60),
-        Vector( 100,  0,  20),
-        Vector(-100,  0,  20),
-        Vector(0,   160,  30),
-        Vector(0,  -160,  30),
-        Vector(0,    0, -20),
-    },
+    [1] = { Vector(0, 0, 60) },
+    [2] = { Vector(0, 0, 60), Vector(110, 0, 20), Vector(-110, 0, 20) },
+    [3] = { Vector(0, 0, 60), Vector(100, 0, 20), Vector(-100, 0, 20),
+            Vector(0, 160, 30), Vector(0, -160, 30), Vector(0, 0, -20) },
 }
-
 local TIER_BURST_DELAY = { [1] = 5.0, [2] = 2.5, [3] = 0.9 }
 local TIER_BURST_COUNT = { [1] = 1,   [2] = 2,   [3] = 4   }
 
@@ -86,32 +73,52 @@ local function SpawnBurstFX(ent, count, tier)
 end
 
 -- ============================================================
---  CONDENSATION CLOUD
---  Fired on every door open AND close event.
---  Uses only vanilla GMod particles — no custom PCF needed.
---
---  Strategy: 6 overlapping smoke puffs scattered around the
---  tail opening, each launched with a slight upward + backward
---  velocity to billow away from the fuselage. White color.
+--  PARTICLE MANAGEMENT
+--  Defined BEFORE any net.Receive that calls these functions.
+--  Lua local functions are not hoisted — order matters.
 -- ============================================================
-local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)   -- must match init.lua
-local CLOUD_PUFF_COUNT   = 6     -- overlapping puffs per event
-local CLOUD_SPREAD_XY    = 55    -- horizontal scatter radius (HU)
-local CLOUD_SPREAD_Z     = 30    -- vertical scatter radius (HU)
+local function StopParticles(state)
+    if not state.particles then return end
+    for _, p in ipairs(state.particles) do
+        if IsValid(p) then p:StopEmission() end
+    end
+    state.particles = {}
+end
+
+local function ApplyFlameParticles(ent, state, tier)
+    StopParticles(state)
+    state.tier = tier
+    if not IsValid(ent) or tier == 0 then return end
+    for _, off in ipairs(TIER_OFFSETS[tier]) do
+        local p = ent:CreateParticleEffect("fire_medium_02", PATTACH_ABSORIGIN_FOLLOW, 0)
+        if IsValid(p) then
+            p:SetControlPoint(0, ent:LocalToWorld(off))
+            table.insert(state.particles, p)
+        end
+    end
+    state.nextBurst = CurTime() + (TIER_BURST_DELAY[tier] or 4)
+end
+
+-- ============================================================
+--  CONDENSATION CLOUD
+--  ParticleEmitter-based, vanilla textures only.
+--
+--  CRASH FIX: removed the invalid p:SetAlpha() call.
+--  CLuaParticle has NO SetAlpha method. The API is:
+--    p:SetStartAlpha(n)  — alpha at birth
+--    p:SetEndAlpha(n)    — alpha at death
+--  Calling p:SetAlpha() crashes the entire net.Receive.
+-- ============================================================
+local TAIL_LOCAL_OFFSET = Vector(-700, 0, -60)
+local CLOUD_PUFF_COUNT  = 6
+local CLOUD_SPREAD_XY   = 55
+local CLOUD_SPREAD_Z    = 30
 
 local function EmitCondensationCloud(ent)
     if not IsValid(ent) then return end
-
     local pos = ent:GetPos()
     local ang = ent:GetAngles()
-
-    -- Compute world-space tail anchor
-    local tailW = LocalToWorld(TAIL_LOCAL_OFFSET, Angle(0, 0, 0), pos, ang)
-
-    -- Velocity of the heli in world space (forward direction * speed).
-    -- We can approximate it from the entity's forward vector.
-    -- Puffs are launched slightly backward + up relative to heading
-    -- so they don't clip through the fuselage.
+    local tailW       = LocalToWorld(TAIL_LOCAL_OFFSET, Angle(0, 0, 0), pos, ang)
     local heliForward = ang:Forward()
 
     for _ = 1, CLOUD_PUFF_COUNT do
@@ -122,40 +129,33 @@ local function EmitCondensationCloud(ent)
         )
         local puffPos = tailW + scatter
 
-        -- Particle: "particle_smoke" — white, fat, slow-rising, no custom PCF.
         local emitter = ParticleEmitter(puffPos)
         if not emitter then continue end
 
-        -- Emit 3 particles per scatter point for density
         for _ = 1, 3 do
-            local p = emitter:Add("particle/particle_smokegrenade", puffPos
-                + Vector(math.Rand(-15,15), math.Rand(-15,15), math.Rand(-8,8)))
+            local jitter = Vector(math.Rand(-15,15), math.Rand(-15,15), math.Rand(-8,8))
+            local p = emitter:Add("particle/particle_smokegrenade", puffPos + jitter)
             if p then
-                -- Pure white, full alpha, fades to transparent
                 p:SetColor(240, 240, 240)
-                p:SetAlpha(220)
-                p:SetDieTime(math.Rand(1.2, 2.2))
+                -- SetStartAlpha / SetEndAlpha are the correct CLuaParticle API.
+                -- There is no SetAlpha method.
                 p:SetStartAlpha(200)
                 p:SetEndAlpha(0)
+                p:SetDieTime(math.Rand(1.2, 2.2))
                 p:SetStartSize(math.Rand(60, 110))
                 p:SetEndSize(math.Rand(180, 280))
                 p:SetRoll(math.Rand(0, 360))
                 p:SetRollDelta(math.Rand(-0.8, 0.8))
-                -- Drift backward away from heli heading + upward
-                local vel = (heliForward * -80)
-                    + Vector(
-                        math.Rand(-40, 40),
-                        math.Rand(-40, 40),
-                        math.Rand(30, 90)
-                    )
-                p:SetVelocity(vel)
-                p:SetGravity(Vector(0, 0, 12))  -- gentle upward gravity override
+                p:SetVelocity(
+                    heliForward * -80 +
+                    Vector(math.Rand(-40,40), math.Rand(-40,40), math.Rand(30,90))
+                )
+                p:SetGravity(Vector(0, 0, 12))
                 p:SetAirResistance(140)
                 p:SetCollide(false)
                 p:SetBounce(0)
             end
         end
-
         emitter:Finish()
     end
 end
@@ -166,16 +166,12 @@ end
 net.Receive("MI12_DoorEvent", function()
     local ent    = net.ReadEntity()
     local isOpen = net.ReadBool()
-    -- Fire cloud on BOTH open and close transitions.
-    -- On open: burst puffs outward (door unsealing pressurized bay).
-    -- On close: smaller puff as bay re-pressurizes.
-    -- We use the same function both ways; the close puff is
-    -- naturally smaller because the entity velocity has shifted.
     EmitCondensationCloud(ent)
- end)
+end)
 
 -- ============================================================
---  NET — damage tier broadcast
+--  NET — damage tier
+--  ApplyFlameParticles is defined above — no forward-ref issue.
 -- ============================================================
 net.Receive("bombin_mi12_damage_tier", function()
     local entIndex = net.ReadUInt(16)
@@ -202,31 +198,6 @@ net.Receive("bombin_mi12_damage_tier", function()
 end)
 
 -- ============================================================
---  PARTICLE MANAGEMENT
--- ============================================================
-local function StopParticles(state)
-    if not state.particles then return end
-    for _, p in ipairs(state.particles) do
-        if IsValid(p) then p:StopEmission() end
-    end
-    state.particles = {}
-end
-
-local function ApplyFlameParticles(ent, state, tier)
-    StopParticles(state)
-    state.tier = tier
-    if not IsValid(ent) or tier == 0 then return end
-    for _, off in ipairs(TIER_OFFSETS[tier]) do
-        local p = ent:CreateParticleEffect("fire_medium_02", PATTACH_ABSORIGIN_FOLLOW, 0)
-        if IsValid(p) then
-            p:SetControlPoint(0, ent:LocalToWorld(off))
-            table.insert(state.particles, p)
-        end
-    end
-    state.nextBurst = CurTime() + (TIER_BURST_DELAY[tier] or 4)
-end
-
--- ============================================================
 --  THINK — particle CP updates + burst scheduling
 -- ============================================================
 hook.Add("Think", "bombin_mi12_damage_fx", function()
@@ -241,14 +212,13 @@ hook.Add("Think", "bombin_mi12_damage_fx", function()
                 state.pendingApply = false
                 ApplyFlameParticles(ent, state, state.tier)
             end
-
             if state.tier > 0 then
                 local pos     = ent:GetPos()
                 local ang     = ent:GetAngles()
                 local offsets = TIER_OFFSETS[state.tier]
                 for i, p in ipairs(state.particles) do
                     if IsValid(p) and offsets[i] then
-                        p:SetControlPoint(0, LocalToWorld(offsets[i], Angle(0, 0, 0), pos, ang))
+                        p:SetControlPoint(0, LocalToWorld(offsets[i], Angle(0,0,0), pos, ang))
                     end
                 end
                 if ct >= state.nextBurst then
@@ -263,20 +233,16 @@ end)
 -- ============================================================
 --  ROTOR ANIMATION
 -- ============================================================
-local RPM_FULL  = ENT.LimitRPM or 3000
-local RPM_MAX   = ENT.LimitRPM or 3000
-
-local BEND1  = math.Remap(RPM_FULL, 0, RPM_MAX, 0, 10)
-local BEND2  = math.Remap(RPM_FULL, 0, RPM_MAX, 0,  4)
-local DROOP  = math.Remap(RPM_FULL, 0, RPM_MAX, 55, 0)
-
+local RPM_FULL = ENT.LimitRPM or 3000
+local RPM_MAX  = ENT.LimitRPM or 3000
+local BEND1    = math.Remap(RPM_FULL, 0, RPM_MAX, 0, 10)
+local BEND2    = math.Remap(RPM_FULL, 0, RPM_MAX, 0,  4)
+local DROOP    = math.Remap(RPM_FULL, 0, RPM_MAX, 55, 0)
 local RotorAcc = {}
 
 local function AnimRotor(ent, idx)
     if not IsValid(ent) then return end
-
     RotorAcc[idx] = (RotorAcc[idx] or 0) + RPM_FULL * FrameTime() * 1.5
-
     ent:ManipulateBoneAngles(33, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(34, Angle(0, 0, BEND2))
     ent:ManipulateBoneAngles(35, Angle(0, 0, BEND1))
@@ -287,7 +253,6 @@ local function AnimRotor(ent, idx)
     ent:ManipulateBoneAngles(40, Angle(0, 0, BEND2))
     ent:ManipulateBoneAngles(41, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(42, Angle(0, 0, BEND2))
-
     ent:ManipulateBoneAngles(45, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(46, Angle(0, 0, BEND2))
     ent:ManipulateBoneAngles(47, Angle(0, 0, BEND1))
@@ -298,13 +263,10 @@ local function AnimRotor(ent, idx)
     ent:ManipulateBoneAngles(52, Angle(0, 0, BEND2))
     ent:ManipulateBoneAngles(53, Angle(0, 0, BEND1))
     ent:ManipulateBoneAngles(54, Angle(0, 0, BEND2))
-
     ent:ManipulateBoneAngles(12, Angle( DROOP, 0, 0))
     ent:ManipulateBoneAngles(13, Angle(-DROOP, 0, 0))
-
     ent:SetBodygroup(2, 1)
     ent:SetBodygroup(3, 1)
-
     ent:SetPoseParameter("rotor_spin", RotorAcc[idx])
     ent:InvalidateBoneCache()
 end
@@ -313,8 +275,6 @@ hook.Add("Think", "bombin_mi12_rotor_anim", function()
     for _, ent in ipairs(ents.FindByClass("ent_mi12_heli")) do
         local idx = ent:EntIndex()
         AnimRotor(ent, idx)
-        if not IsValid(ent) then
-            RotorAcc[idx] = nil
-        end
+        if not IsValid(ent) then RotorAcc[idx] = nil end
     end
 end)
