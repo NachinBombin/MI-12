@@ -33,7 +33,7 @@ local PASS_SOUND_B = "vehicles/apc/apc_idle1.wav"
 local MODEL_YAW_OFFSET    = 0
 local ROLL_SUSTAINED_GAIN = 1.8
 local ROLL_TRANSIENT_GAIN = 45.0
-local ROLL_MAX            = 18.0
+local ROLL_MAX            = 33.0
 local ROLL_LERP_IN        = 0.06
 local ROLL_LERP_OUT       = 0.01
 local GIB_LIFETIME        = 40
@@ -45,11 +45,11 @@ local TWO_PI = math.pi * 2
 -- ============================================================
 local MANHACK_CAP        = 20
 local MANHACK_BURST      = 2
-local MANHACK_INTERVAL   = 0.25
+local MANHACK_INTERVAL   = 0.5
 local MANHACK_COUNT_INT  = 5
 local MANHACK_LAUNCH_SPD = 1200
 -- How long the door stays open after a burst before closing again.
-local DOOR_OPEN_TIME     = 1.5
+local DOOR_OPEN_TIME     = 4.5
 -- Local-space tail exit point. MI-12 faces +X at yaw=0 so tail = -X.
 local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)
 
