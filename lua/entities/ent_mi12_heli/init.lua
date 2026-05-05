@@ -9,10 +9,10 @@ AddCSLuaFile("cl_trailsystem.lua")
 include("shared.lua")
 
 util.AddNetworkString("bombin_mi12_damage_tier")
-util.AddNetworkString("MI12_DoorEvent")  -- new: door open/close puff
+util.AddNetworkString("MI12_DoorEvent")
 
 -- ============================================================
---  CACHED CONSTANTS  (from shared.lua)
+--  CACHED CONSTANTS
 -- ============================================================
 local MODEL_PATH      = ENT.ModelPath
 local GIB_MODELS      = ENT.GibModels
@@ -23,9 +23,20 @@ local ALT_DRIFT_LERP  = ENT.AltDriftLerp
 local JITTER_AMP      = ENT.JitterAmplitude
 local ALERT_INTERVAL  = ENT.AlertInterval
 
-local DOOR_BG_INDEX  = ENT.DoorBodygroupIndex  -- 1
-local DOOR_BG_OPEN   = ENT.DoorBodygroupOpen   -- 1
-local DOOR_BG_CLOSED = ENT.DoorBodygroupClose  -- 0
+-- ============================================================
+--  DOOR BODYGROUP
+--  mi12_door_bg_index lets you test different indices live
+--  without restarting the server. Default = 1 (from shared.lua).
+--  Change with: "mi12_door_bg_index 0" in server console,
+--  then respawn the heli.
+-- ============================================================
+local CV_DOOR_INDEX = CreateConVar("mi12_door_bg_index", tostring(ENT.DoorBodygroupIndex),
+    FCVAR_NOTIFY, "Bodygroup index that controls the MI-12 cargo doors. Test 0-4.")
+
+local DOOR_BG_OPEN   = ENT.DoorBodygroupOpen    -- 1
+local DOOR_BG_CLOSED = ENT.DoorBodygroupClose   -- 0
+
+local function DoorBGIndex() return CV_DOOR_INDEX:GetInt() end
 
 -- ============================================================
 --  FLIGHT CONSTANTS
@@ -139,14 +150,14 @@ local function SpawnGibs(origin)
                 ph:ApplyForceCenter(Vector(math.Rand(-400,400), math.Rand(-400,400), math.Rand(300,900)) * 2000)
                 ph:ApplyTorqueCenter(Vector(math.Rand(-2000,2000), math.Rand(-2000,2000), math.Rand(-2000,2000)))
             end
-            timer.Simple(0,           function() if IsValid(gib) then gib:Ignite(GIB_LIFETIME, 0) end end)
+            timer.Simple(0,            function() if IsValid(gib) then gib:Ignite(GIB_LIFETIME, 0) end end)
             timer.Simple(GIB_LIFETIME, function() if IsValid(gib) then gib:Remove()               end end)
         end)
     end
 end
 
 -- ============================================================
---  DOOR  —  bodygroup + condensation cloud net broadcast
+--  DOOR — bodygroup toggle + net broadcast
 -- ============================================================
 local function BroadcastDoorEvent(ent, isOpen)
     net.Start("MI12_DoorEvent")
@@ -156,12 +167,16 @@ local function BroadcastDoorEvent(ent, isOpen)
 end
 
 function ENT:OpenDoors()
-    self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_OPEN)
+    local idx = DoorBGIndex()
+    self:SetBodygroup(idx, DOOR_BG_OPEN)
+    print(string.format("[MI-12] OpenDoors  → SetBodygroup(%d, %d)", idx, DOOR_BG_OPEN))
     BroadcastDoorEvent(self, true)
 end
 
 function ENT:CloseDoors()
-    self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
+    local idx = DoorBGIndex()
+    self:SetBodygroup(idx, DOOR_BG_CLOSED)
+    print(string.format("[MI-12] CloseDoors → SetBodygroup(%d, %d)", idx, DOOR_BG_CLOSED))
     BroadcastDoorEvent(self, false)
 end
 
@@ -341,9 +356,34 @@ function ENT:Initialize()
     self:SetColor(Color(255,255,255,0))
     self:SetHealth(MAX_HP)
 
-    self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
-    self:SetBodygroup(2, 1)
-    self:SetBodygroup(3, 1)
+    -- --------------------------------------------------------
+    --  Print all bodygroups so we can verify the door index.
+    --  Check server console after spawning the heli.
+    -- --------------------------------------------------------
+    local bgCount = self:GetNumBodyGroups()
+    print(string.format("[MI-12] Model has %d bodygroup(s):", bgCount))
+    for i = 0, bgCount - 1 do
+        print(string.format("  bg[%d] name=%-20s subcount=%d",
+            i,
+            self:GetBodygroupName(i),
+            self:GetBodygroupCount(i)
+        ))
+    end
+    print(string.format("[MI-12] Door will use bg[%d] (mi12_door_bg_index). open=%d closed=%d",
+        DoorBGIndex(), DOOR_BG_OPEN, DOOR_BG_CLOSED))
+
+    -- Close doors at spawn (correct index via convar)
+    self:SetBodygroup(DoorBGIndex(), DOOR_BG_CLOSED)
+
+    -- --------------------------------------------------------
+    --  Bodygroups 2 and 3 are for rotor blur meshes on this
+    --  model (confirmed from cl_init bone list). Set them to
+    --  submodel 1 (blur on) at spawn.
+    --  NOTE: if the door turns out to be bg 2 or 3, remove
+    --  these lines and update DoorBodygroupIndex in shared.lua.
+    -- --------------------------------------------------------
+    if DoorBGIndex() ~= 2 then self:SetBodygroup(2, 1) end
+    if DoorBGIndex() ~= 3 then self:SetBodygroup(3, 1) end
 
     local orbitDir = (math.random(2) == 1) and 1 or -1
     local right    = Vector(-dir.y, dir.x, 0)
