@@ -43,14 +43,13 @@ local TWO_PI = math.pi * 2
 -- ============================================================
 --  MANHACK ABILITY CONSTANTS
 -- ============================================================
-local MANHACK_CAP        = 20      -- global live manhack ceiling
-local MANHACK_BURST      = 2       -- how many per launch
-local MANHACK_INTERVAL   = 0.25    -- seconds between bursts
-local MANHACK_COUNT_INT  = 5       -- seconds between cap re-checks
-local MANHACK_LAUNCH_SPD = 1200    -- HU/s launch velocity
--- Local-space offset from entity origin toward the tail.
--- MI-12 faces +X (yaw 0 = forward +X), so tail is in the -X direction.
--- Adjust the X component if the model's tail sits differently.
+local MANHACK_CAP        = 20
+local MANHACK_BURST      = 2
+local MANHACK_INTERVAL   = 0.25
+local MANHACK_COUNT_INT  = 5
+local MANHACK_LAUNCH_SPD = 1200
+-- Local-space offset from entity origin to the tail exit point.
+-- MI-12 faces +X at yaw=0, so tail is negative X. Tune X if needed.
 local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)
 
 -- ============================================================
@@ -169,30 +168,28 @@ end
 --  MANHACK ABILITY
 -- ============================================================
 
--- Returns the nearest valid target (player alive or rebel NPC) to `origin`.
--- Returns nil if no valid target exists.
+-- Returns nearest alive player or rebel NPC to `origin`. Nil if none.
 local function FindNearestTarget(origin)
-    local bestDist = math.huge
-    local bestEnt  = nil
+    local bestDistSq = math.huge
+    local bestEnt    = nil
 
-    -- Check players
     for _, ply in ipairs(player.GetAll()) do
-        if IsValid(ply) and ply:Alive() and not ply:IsObserver() then
+        -- IsValid + Alive() is sufficient; IsObserver does not exist in GMod
+        if IsValid(ply) and ply:Alive() then
             local d = origin:DistToSqr(ply:GetPos())
-            if d < bestDist then
-                bestDist = d
-                bestEnt  = ply
+            if d < bestDistSq then
+                bestDistSq = d
+                bestEnt    = ply
             end
         end
     end
 
-    -- Check rebel NPCs
     for _, npc in ipairs(ents.FindByClass("npc_citizen")) do
         if IsValid(npc) and npc:Health() > 0 then
             local d = origin:DistToSqr(npc:GetPos())
-            if d < bestDist then
-                bestDist = d
-                bestEnt  = npc
+            if d < bestDistSq then
+                bestDistSq = d
+                bestEnt    = npc
             end
         end
     end
@@ -200,13 +197,11 @@ local function FindNearestTarget(origin)
     return bestEnt
 end
 
--- Computes the world-space tail position by rotating TAIL_LOCAL_OFFSET
--- by the helicopter's current angles.
+-- Rotates TAIL_LOCAL_OFFSET by the heli's current angles to get world tail pos.
 local function GetTailPos(heli)
-    local ang = heli:GetAngles()
-    local fwd, right, up = ang:Forward(), ang:Right(), ang:Up()
-    -- LocalToWorld equivalent without a parent entity:
-    -- world = origin + fwd*x + right*y + up*z
+    local fwd, right, up = heli:GetAngles():Forward(),
+                           heli:GetAngles():Right(),
+                           heli:GetAngles():Up()
     local o = TAIL_LOCAL_OFFSET
     return heli:GetPos()
         + fwd   * o.x
@@ -214,49 +209,41 @@ local function GetTailPos(heli)
         + up    * o.z
 end
 
--- Launches one manhack from `spawnPos` pre-agro toward `target`.
+-- Spawns and launches one manhack from spawnPos pre-agro toward target.
 local function LaunchManhack(spawnPos, target)
     local mh = ents.Create("npc_manhack")
     if not IsValid(mh) then return end
 
     mh:SetPos(spawnPos)
-    -- Orient the manhack roughly toward the target so its local forward
-    -- is already aimed on spawn.
-    local toTarget = (target:GetPos() - spawnPos)
+    -- Face the manhack toward the target on spawn.
+    local toTarget = target:GetPos() - spawnPos
     toTarget.z = 0
     if toTarget:LengthSqr() > 1 then
-        toTarget:Normalize()
         mh:SetAngles(toTarget:Angle())
     end
 
     mh:Spawn()
     mh:Activate()
 
-    -- Pre-agro: set enemy and memory before the NPC runs its first Think.
+    -- Pre-agro: set enemy and update memory so the AI wakes up hostile.
+    -- Do NOT call SetSchedule -- npc_manhack manages its own schedule internally.
     mh:SetEnemy(target)
     if mh.UpdateEnemyMemory then
         mh:UpdateEnemyMemory(target, target:GetPos())
     end
-    mh:SetSchedule(SCHED_CHASE_ENEMY)
 
-    -- Launch: apply velocity toward target.
+    -- Launch: physics impulse toward target.
     local ph = mh:GetPhysicsObject()
     if IsValid(ph) then
         ph:Wake()
-        local vel = (target:GetPos() - spawnPos)
-        if vel:LengthSqr() > 1 then
-            vel:Normalize()
-        else
-            vel = Vector(0, 0, -1)
-        end
+        local vel = target:GetPos() - spawnPos
+        if vel:LengthSqr() > 1 then vel:Normalize() else vel = Vector(0, 0, -1) end
         ph:SetVelocity(vel * MANHACK_LAUNCH_SPD)
     end
 end
 
--- Burst: launches MANHACK_BURST manhacks if the global cap is not yet hit.
--- `blocked` is the cached flag; the 5s timer refreshes it.
 function ENT:ManhackBurst()
-    if self.IsDestroyed then return end
+    if self.IsDestroyed    then return end
     if self.ManhackBlocked then return end
 
     local tailPos = GetTailPos(self)
@@ -264,7 +251,6 @@ function ENT:ManhackBurst()
     if not IsValid(target) then return end
 
     for i = 1, MANHACK_BURST do
-        -- Slight spread on spawn position so they don't stack on the same point.
         local spread = Vector(
             math.Rand(-30, 30),
             math.Rand(-30, 30),
@@ -274,16 +260,12 @@ function ENT:ManhackBurst()
     end
 end
 
--- Re-counts live manhacks every MANHACK_COUNT_INT seconds.
--- Sets self.ManhackBlocked = true when at or over cap.
 function ENT:ManhackCountCheck()
     if not IsValid(self) then return end
     local count = #ents.FindByClass("npc_manhack")
     self.ManhackBlocked = (count >= MANHACK_CAP)
 end
 
--- Starts both the burst timer and the count-check timer, keyed by EntIndex
--- so multiple instances never collide.
 function ENT:StartManhackSystem()
     local idx = self:EntIndex()
 
@@ -291,7 +273,6 @@ function ENT:StartManhackSystem()
     self.ManhackBurstName = "mi12_manhack_burst_" .. idx
     self.ManhackCountName = "mi12_manhack_count_" .. idx
 
-    -- Burst timer: fires every MANHACK_INTERVAL.
     timer.Create(self.ManhackBurstName, MANHACK_INTERVAL, 0, function()
         if not IsValid(self) then
             timer.Remove(self.ManhackBurstName)
@@ -300,8 +281,7 @@ function ENT:StartManhackSystem()
         self:ManhackBurst()
     end)
 
-    -- Count timer: refreshes the blocked flag every MANHACK_COUNT_INT seconds.
-    -- Runs immediately once so the very first burst has a valid flag.
+    -- Run once immediately to populate the flag before the first burst.
     self:ManhackCountCheck()
     timer.Create(self.ManhackCountName, MANHACK_COUNT_INT, 0, function()
         if not IsValid(self) then
@@ -367,7 +347,9 @@ function ENT:Initialize()
     self:SetMoveType(MOVETYPE_NONE)
     self:SetSolid(SOLID_BBOX)
     self:SetCollisionBounds(Vector(-350, -700, -80), Vector(350, 700, 420))
-    self:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
+    -- FIX: COLLISION_GROUP_NONE lets MASK_SHOT traces land and OnTakeDamage fire.
+    -- COLLISION_GROUP_IN_VEHICLE blocked weapon damage traces.
+    self:SetCollisionGroup(COLLISION_GROUP_NONE)
     self:DrawShadow(false)
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
@@ -468,6 +450,9 @@ end
 --  DOORS
 -- ============================================================
 function ENT:SpawnDoors()
+    -- hidden=true  → SetNotSolid(true) + SetNoDraw(true)  → invisible
+    -- hidden=false → SetNotSolid(false) + SetNoDraw(false) → visible
+    -- FIX: closed door must be VISIBLE at rest; open door must start hidden.
     local function MakeDoor(mdl, hidden)
         local d = ents.Create("prop_physics")
         if not IsValid(d) then return nil end
@@ -482,8 +467,9 @@ function ENT:SpawnDoors()
         if IsValid(ph) then ph:EnableMotion(false) end
         return d
     end
-    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, true)
-    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   false)
+    -- Closed door visible (hidden=false), open door hidden (hidden=true)
+    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, false)
+    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   true)
 end
 
 -- ============================================================
@@ -613,10 +599,12 @@ function ENT:Think()
     self.PrevTurnRate   = turnRate
     local sustained     = math.Clamp(turnRate      * ROLL_SUSTAINED_GAIN, -ROLL_MAX, ROLL_MAX)
     local transient     = math.Clamp(turnRateDelta * ROLL_TRANSIENT_GAIN, -12, 12)
-    local rollTarget    = math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
-    local building      = (rollTarget * self.SmoothedRoll >= 0)
-                          and (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
-    self.SmoothedRoll   = Lerp(building and ROLL_LERP_IN or ROLL_LERP_OUT, self.SmoothedRoll, rollTarget)
+    -- FIX: negate rollTarget — positive turnRate (turning left) must bank left
+    -- which in Source engine Angle roll convention requires a negative value.
+    local rollTarget  = -math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
+    local building    = (rollTarget * self.SmoothedRoll >= 0)
+                        and (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
+    self.SmoothedRoll = Lerp(building and ROLL_LERP_IN or ROLL_LERP_OUT, self.SmoothedRoll, rollTarget)
 
     local climbDelta   = math.Clamp((liveAlt - pos.z) / 400, -1, 1)
     self.SmoothedPitch = Lerp(0.03, self.SmoothedPitch, math.Clamp(climbDelta * 6, -8, 8))
