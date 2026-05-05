@@ -38,14 +38,18 @@ local GIB_LIFETIME        = 40
 local TWO_PI              = math.pi * 2
 
 -- ============================================================
---  MANHACK ABILITY CONSTANTS
+--  MANHACK CONSTANTS
+--
+--  Spawning model:
+--   1. Every MANHACK_CHECK_INTERVAL seconds, count alive npc_manhack entities.
+--   2. If count < MANHACK_CAP  → OpenDoors + start pair-spawn loop.
+--   3. If count >= MANHACK_CAP → stop pair-spawn loop + CloseDoors.
+--   4. While the door is open, LaunchManhack x2 fires every MANHACK_PAIR_INTERVAL.
 -- ============================================================
 local MANHACK_CAP            = 20
-local MANHACK_BURST          = 3
-local MANHACK_BURST_INTERVAL = 5.0
-local MANHACK_COUNT_INT      = 8
+local MANHACK_PAIR_INTERVAL  = 0.5    -- seconds between each pair
+local MANHACK_CHECK_INTERVAL = 5.0    -- seconds between cap checks
 local MANHACK_LAUNCH_SPD     = 1200
-local DOOR_OPEN_TIME         = 2.0
 local TAIL_LOCAL_OFFSET      = Vector(-700, 0, -60)
 
 -- ============================================================
@@ -145,17 +149,6 @@ end
 
 -- ============================================================
 --  DOOR SYSTEM
---
---  Visual animation: sequences baked into Mi12_Homer.mdl, played via
---    self:ResetSequence(self:LookupSequence("Close")) — lowers the ramp (bay opens)
---    self:ResetSequence(self:LookupSequence("Open"))  — raises the ramp (bay closes)
---  LFS animation names are inverted relative to bay state.
---
---  doormdl (Door_Closed prop) = collision blocker for the lowered ramp floor.
---  doormdl2 (Door_Open prop)  = always solid, never toggled.
---
---  DoorIsOpen = false → bay closed, doormdl non-solid (ramp up, no floor)
---  DoorIsOpen = true  → bay open,   doormdl solid    (ramp down, floor present)
 -- ============================================================
 local function SpawnDoorProps(ent)
     local dc = ents.Create("prop_physics")
@@ -165,7 +158,7 @@ local function SpawnDoorProps(ent)
     dc.DoNotDuplicate = true
     dc:SetParent(ent)
     dc:Spawn()
-    dc:SetNotSolid(true)    -- non-solid at spawn; matches LFS exactly
+    dc:SetNotSolid(true)
     ent.doormdl = dc
 
     local do2 = ents.Create("prop_physics")
@@ -194,31 +187,21 @@ end
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    self:ResetSequence(self:LookupSequence("Close"))   -- lowers ramp visually
+    self:ResetSequence(self:LookupSequence("Close"))  -- lowers ramp visually
     if IsValid(self.doormdl) then self.doormdl:SetNotSolid(false) end
-    BroadcastDoorEvent(self, true)
+    BroadcastDoorEvent(self, true)  -- cloud FX fires on client for isOpen=true only
 end
 
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    self:ResetSequence(self:LookupSequence("Open"))    -- raises ramp visually
+    self:ResetSequence(self:LookupSequence("Open"))   -- raises ramp visually
     if IsValid(self.doormdl) then self.doormdl:SetNotSolid(true) end
-    BroadcastDoorEvent(self, false)
+    BroadcastDoorEvent(self, false) -- no cloud FX on close (handled client-side)
 end
 
 -- ============================================================
---  SPAWN PARAMETERS
--- ============================================================
-local function ReadParam(self, key, default)
-    if self.SpawnParams and self.SpawnParams[key] ~= nil then
-        return self.SpawnParams[key]
-    end
-    return default
-end
-
--- ============================================================
---  MANHACK ABILITY
+--  MANHACK HELPERS
 -- ============================================================
 local function FindNearestTarget(origin)
     local bestSq  = math.huge
@@ -267,71 +250,73 @@ local function LaunchManhack(spawnPos, target)
     end
 end
 
-function ENT:ManhackBurst()
-    if self.IsDestroyed then return end
-    local tailPos = GetTailPos(self)
-    local target  = FindNearestTarget(tailPos)
-    if not IsValid(target) then return end
-
-    self:OpenDoors()
-
-    for _ = 1, MANHACK_BURST do
-        LaunchManhack(
-            tailPos + Vector(math.Rand(-30,30), math.Rand(-30,30), math.Rand(-20,20)),
-            target
-        )
-    end
-
-    timer.Remove("mi12_door_close_" .. self:EntIndex())
-    timer.Simple(DOOR_OPEN_TIME, function()
-        if IsValid(self) and not self.IsDestroyed then self:CloseDoors() end
+-- ============================================================
+--  PAIR-SPAWN LOOP
+--  Runs every MANHACK_PAIR_INTERVAL while the door is open.
+--  Stopped by StopSpawning() or StopManhackSystem().
+-- ============================================================
+function ENT:StartSpawning()
+    if timer.Exists(self.MhPairTimer) then return end
+    timer.Create(self.MhPairTimer, MANHACK_PAIR_INTERVAL, 0, function()
+        if not IsValid(self) or self.IsDestroyed then
+            timer.Remove(self.MhPairTimer)
+            return
+        end
+        if not self.DoorIsOpen then
+            timer.Remove(self.MhPairTimer)
+            return
+        end
+        local tailPos = GetTailPos(self)
+        local target  = FindNearestTarget(tailPos)
+        if not IsValid(target) then return end
+        for _ = 1, 2 do
+            LaunchManhack(
+                tailPos + Vector(math.Rand(-30,30), math.Rand(-30,30), math.Rand(-20,20)),
+                target
+            )
+        end
     end)
 end
 
-function ENT:ManhackBurstStart()
-    if timer.Exists(self.MhBurstTimer) then return end
-    timer.Create(self.MhBurstTimer, MANHACK_BURST_INTERVAL, 0, function()
-        if not IsValid(self) then timer.Remove(self.MhBurstTimer); return end
-        self:ManhackBurst()
-    end)
+function ENT:StopSpawning()
+    if self.MhPairTimer then timer.Remove(self.MhPairTimer) end
 end
 
-function ENT:ManhackBurstStop()
-    timer.Remove(self.MhBurstTimer)
-    if IsValid(self) then self:CloseDoors() end
-end
-
-function ENT:ManhackCountCheck()
+-- ============================================================
+--  CAP CHECK  (every MANHACK_CHECK_INTERVAL seconds)
+--  < 20 alive → open door + start pair-spawn
+--  >= 20 alive → stop pair-spawn + close door
+-- ============================================================
+function ENT:ManhackCapCheck()
     if not IsValid(self) or self.IsDestroyed then return end
-    if #ents.FindByClass("npc_manhack") < MANHACK_CAP then
-        self:ManhackBurstStart()
+    local alive = #ents.FindByClass("npc_manhack")
+    if alive < MANHACK_CAP then
+        self:OpenDoors()
+        self:StartSpawning()
     else
-        self:ManhackBurstStop()
+        self:StopSpawning()
+        self:CloseDoors()
     end
 end
 
 function ENT:StartManhackSystem()
     local idx         = self:EntIndex()
-    self.MhBurstTimer = "mi12_mh_burst_" .. idx
-    self.MhCountTimer = "mi12_mh_count_" .. idx
-    timer.Simple(MANHACK_BURST_INTERVAL, function()
-        if not IsValid(self) then return end
-        self:ManhackCountCheck()
-    end)
-    timer.Create(self.MhCountTimer, MANHACK_COUNT_INT, 0, function()
+    self.MhPairTimer  = "mi12_mh_pair_"  .. idx
+    self.MhCheckTimer = "mi12_mh_check_" .. idx
+    -- First check after one interval so the heli has time to enter the map.
+    timer.Create(self.MhCheckTimer, MANHACK_CHECK_INTERVAL, 0, function()
         if not IsValid(self) then
-            timer.Remove(self.MhCountTimer)
-            timer.Remove(self.MhBurstTimer)
+            timer.Remove(self.MhCheckTimer)
+            timer.Remove(self.MhPairTimer)
             return
         end
-        self:ManhackCountCheck()
+        self:ManhackCapCheck()
     end)
 end
 
 function ENT:StopManhackSystem()
-    if self.MhBurstTimer then timer.Remove(self.MhBurstTimer) end
-    if self.MhCountTimer  then timer.Remove(self.MhCountTimer) end
-    timer.Remove("mi12_door_close_" .. self:EntIndex())
+    if self.MhPairTimer  then timer.Remove(self.MhPairTimer)  end
+    if self.MhCheckTimer then timer.Remove(self.MhCheckTimer) end
     if IsValid(self) then self:CloseDoors() end
 end
 
@@ -447,6 +432,16 @@ function ENT:Initialize()
 
     timer.Simple(life, function() if IsValid(self) then self:Remove() end end)
     self:NextThink(CurTime())
+end
+
+-- ============================================================
+--  SPAWN PARAMETERS
+-- ============================================================
+local function ReadParam(self, key, default)
+    if self.SpawnParams and self.SpawnParams[key] ~= nil then
+        return self.SpawnParams[key]
+    end
+    return default
 end
 
 -- ============================================================
@@ -675,5 +670,4 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
-    -- door props removed by CallOnRemove("RemoveDoorBlocker")
 end

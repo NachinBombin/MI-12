@@ -74,8 +74,6 @@ end
 
 -- ============================================================
 --  PARTICLE MANAGEMENT
---  Defined BEFORE any net.Receive that calls these functions.
---  Lua local functions are not hoisted — order matters.
 -- ============================================================
 local function StopParticles(state)
     if not state.particles then return end
@@ -101,13 +99,7 @@ end
 
 -- ============================================================
 --  CONDENSATION CLOUD
---  ParticleEmitter-based, vanilla textures only.
---
---  CRASH FIX: removed the invalid p:SetAlpha() call.
---  CLuaParticle has NO SetAlpha method. The API is:
---    p:SetStartAlpha(n)  — alpha at birth
---    p:SetEndAlpha(n)    — alpha at death
---  Calling p:SetAlpha() crashes the entire net.Receive.
+--  Only fires when the door OPENS (isOpen == true).
 -- ============================================================
 local TAIL_LOCAL_OFFSET = Vector(-700, 0, -60)
 local CLOUD_PUFF_COUNT  = 6
@@ -137,8 +129,6 @@ local function EmitCondensationCloud(ent)
             local p = emitter:Add("particle/particle_smokegrenade", puffPos + jitter)
             if p then
                 p:SetColor(240, 240, 240)
-                -- SetStartAlpha / SetEndAlpha are the correct CLuaParticle API.
-                -- There is no SetAlpha method.
                 p:SetStartAlpha(200)
                 p:SetEndAlpha(0)
                 p:SetDieTime(math.Rand(1.2, 2.2))
@@ -162,16 +152,18 @@ end
 
 -- ============================================================
 --  NET — door event
+--  Cloud only emitted on open (isOpen == true).
 -- ============================================================
 net.Receive("MI12_DoorEvent", function()
     local ent    = net.ReadEntity()
     local isOpen = net.ReadBool()
-    EmitCondensationCloud(ent)
+    if isOpen then
+        EmitCondensationCloud(ent)
+    end
 end)
 
 -- ============================================================
 --  NET — damage tier
---  ApplyFlameParticles is defined above — no forward-ref issue.
 -- ============================================================
 net.Receive("bombin_mi12_damage_tier", function()
     local entIndex = net.ReadUInt(16)
