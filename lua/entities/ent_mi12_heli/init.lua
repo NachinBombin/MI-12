@@ -53,6 +53,16 @@ local MANHACK_LAUNCH_SPD     = 1200
 local TAIL_LOCAL_OFFSET      = Vector(-700, 0, -60)
 
 -- ============================================================
+--  SPAWN PARAMETERS  (must be defined before ENT:Initialize)
+-- ============================================================
+local function ReadParam(self, key, default)
+    if self.SpawnParams and self.SpawnParams[key] ~= nil then
+        return self.SpawnParams[key]
+    end
+    return default
+end
+
+-- ============================================================
 --  ORBIT PROBE
 -- ============================================================
 local PROBE_DIRS = {}
@@ -303,7 +313,6 @@ function ENT:StartManhackSystem()
     local idx         = self:EntIndex()
     self.MhPairTimer  = "mi12_mh_pair_"  .. idx
     self.MhCheckTimer = "mi12_mh_check_" .. idx
-    -- First check after one interval so the heli has time to enter the map.
     timer.Create(self.MhCheckTimer, MANHACK_CHECK_INTERVAL, 0, function()
         if not IsValid(self) then
             timer.Remove(self.MhCheckTimer)
@@ -432,16 +441,6 @@ function ENT:Initialize()
 
     timer.Simple(life, function() if IsValid(self) then self:Remove() end end)
     self:NextThink(CurTime())
-end
-
--- ============================================================
---  SPAWN PARAMETERS
--- ============================================================
-local function ReadParam(self, key, default)
-    if self.SpawnParams and self.SpawnParams[key] ~= nil then
-        return self.SpawnParams[key]
-    end
-    return default
 end
 
 -- ============================================================
