@@ -40,14 +40,26 @@ local TWO_PI              = math.pi * 2
 
 -- ============================================================
 --  MANHACK ABILITY CONSTANTS
+--
+--  Root cause of "doors always open":
+--    Old MANHACK_INTERVAL = 0.25s  (burst every 250ms)
+--    Old DOOR_OPEN_TIME   = 1.5s   (close timer)
+--    => Door opened 6x before the close timer fired once.
+--       The close timer was always being cancelled/reset.
+--
+--  Fix:
+--    MANHACK_BURST_INTERVAL = 5s   (one burst event every 5 seconds)
+--    DOOR_OPEN_TIME         = 2.0s (door stays open for the burst window)
+--    Within each burst event we fire MANHACK_BURST manhacks
+--    in rapid succession via a one-shot loop, no repeating timer.
 -- ============================================================
-local MANHACK_CAP        = 20
-local MANHACK_BURST      = 2
-local MANHACK_INTERVAL   = 0.25   -- seconds between bursts
-local MANHACK_COUNT_INT  = 5      -- how often cap is re-checked
-local MANHACK_LAUNCH_SPD = 1200
-local DOOR_OPEN_TIME     = 1.5    -- seconds door stays open after a burst
-local TAIL_LOCAL_OFFSET  = Vector(-700, 0, -60)
+local MANHACK_CAP            = 20
+local MANHACK_BURST          = 3     -- manhacks per burst event
+local MANHACK_BURST_INTERVAL = 5.0   -- seconds between burst events
+local MANHACK_COUNT_INT      = 8     -- cap re-check interval
+local MANHACK_LAUNCH_SPD     = 1200
+local DOOR_OPEN_TIME         = 2.0   -- door stays open this long after a burst
+local TAIL_LOCAL_OFFSET      = Vector(-700, 0, -60)
 
 -- ============================================================
 --  ORBIT PROBE
@@ -145,7 +157,7 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR  —  bodygroup on main model, no props
+--  DOOR  —  bodygroup helpers
 -- ============================================================
 function ENT:OpenDoors()
     self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_OPEN)
@@ -157,9 +169,6 @@ end
 
 -- ============================================================
 --  SPAWN PARAMETERS
---  base_anim has no GetVar/SetVar — we pass data via
---  ENT.SpawnParams (set by the spawner right before Spawn())
---  and read it once in Initialize.
 -- ============================================================
 local function ReadParam(self, key, default)
     if self.SpawnParams and self.SpawnParams[key] ~= nil then
@@ -218,11 +227,16 @@ local function LaunchManhack(spawnPos, target)
     end
 end
 
+--
+--  ManhackBurst: fires MANHACK_BURST manhacks, opens the door,
+--  then schedules ONE close. No repeating timer inside this function.
+--  The repeating timer (MhBurstTimer) calls this every MANHACK_BURST_INTERVAL.
+--
 function ENT:ManhackBurst()
     if self.IsDestroyed then return end
     local tailPos = GetTailPos(self)
     local target  = FindNearestTarget(tailPos)
-    if not IsValid(target) then return end
+    if not IsValid(target) then return end  -- no target -> door stays closed
 
     self:OpenDoors()
 
@@ -233,16 +247,22 @@ function ENT:ManhackBurst()
         )
     end
 
+    -- One authoritative close timer per entity. Remove old one first so we
+    -- never have two timers fighting over the bodygroup state.
     local closeKey = "mi12_door_close_" .. self:EntIndex()
     timer.Remove(closeKey)
     timer.Simple(DOOR_OPEN_TIME, function()
-        if IsValid(self) and not self.IsDestroyed then self:CloseDoors() end
+        if IsValid(self) and not self.IsDestroyed then
+            self:CloseDoors()
+        end
     end)
 end
 
 function ENT:ManhackBurstStart()
     if timer.Exists(self.MhBurstTimer) then return end
-    timer.Create(self.MhBurstTimer, MANHACK_INTERVAL, 0, function()
+    -- Create the repeating timer that fires one burst event at a time.
+    -- Between events the door is closed (DOOR_OPEN_TIME < MANHACK_BURST_INTERVAL).
+    timer.Create(self.MhBurstTimer, MANHACK_BURST_INTERVAL, 0, function()
         if not IsValid(self) then timer.Remove(self.MhBurstTimer); return end
         self:ManhackBurst()
     end)
@@ -250,6 +270,8 @@ end
 
 function ENT:ManhackBurstStop()
     timer.Remove(self.MhBurstTimer)
+    -- Force door closed when we stop dropping manhacks.
+    if IsValid(self) then self:CloseDoors() end
 end
 
 function ENT:ManhackCountCheck()
@@ -265,7 +287,12 @@ function ENT:StartManhackSystem()
     local idx          = self:EntIndex()
     self.MhBurstTimer  = "mi12_mh_burst_" .. idx
     self.MhCountTimer  = "mi12_mh_count_" .. idx
-    self:ManhackCountCheck()
+    -- Delay the first check by one full interval so the heli has time to
+    -- fade in and reach orbit before dropping manhacks on spawn.
+    timer.Simple(MANHACK_BURST_INTERVAL, function()
+        if not IsValid(self) then return end
+        self:ManhackCountCheck()
+    end)
     timer.Create(self.MhCountTimer, MANHACK_COUNT_INT, 0, function()
         if not IsValid(self) then
             timer.Remove(self.MhCountTimer)
@@ -280,6 +307,8 @@ function ENT:StopManhackSystem()
     if self.MhBurstTimer then timer.Remove(self.MhBurstTimer) end
     if self.MhCountTimer  then timer.Remove(self.MhCountTimer) end
     timer.Remove("mi12_door_close_" .. self:EntIndex())
+    -- Ensure door is closed on cleanup regardless of state.
+    if IsValid(self) then self:CloseDoors() end
 end
 
 -- ============================================================
@@ -303,7 +332,6 @@ end
 --  ENT:Initialize
 -- ============================================================
 function ENT:Initialize()
-    -- Read params set by spawner (SpawnParams table on ENT before Spawn())
     local center = ReadParam(self, "CenterPos",    self:GetPos())
     local dir    = ReadParam(self, "CallDir",      Vector(1, 0, 0))
     local speed  = ReadParam(self, "Speed",        280)
@@ -330,12 +358,11 @@ function ENT:Initialize()
     self:SetColor(Color(255,255,255,0))
     self:SetHealth(MAX_HP)
 
-    -- Door closed, rotor blur disc on
+    -- Door starts CLOSED. Bodygroups 2 and 3 = rotor blur discs on.
     self:SetBodygroup(DOOR_BG_INDEX, DOOR_BG_CLOSED)
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- Orbit entry point tangent to requested radius
     local orbitDir = (math.random(2) == 1) and 1 or -1
     local right    = Vector(-dir.y, dir.x, 0)
     local tangent  = Vector(right.x * orbitDir, right.y * orbitDir, 0)
@@ -349,7 +376,6 @@ function ENT:Initialize()
     if not util.IsInWorld(spawnPos) then print("[MI-12] OOB spawn, removing"); self:Remove(); return end
     self:SetPos(spawnPos)
 
-    -- State
     self.CenterPos      = Vector(center.x, center.y, skyZ)
     self.OrbitRadius    = radius
     self.OrbitDirection = orbitDir
@@ -411,7 +437,6 @@ function ENT:Think()
     local dt = FrameTime()
     if dt <= 0 then dt = 0.01 end
 
-    -- Fade in / fade out alpha
     local age  = ct - self.SpawnTime
     local left = self.DieTime - ct
     local alpha
@@ -424,7 +449,6 @@ function ENT:Think()
     end
     self:SetColor(Color(255, 255, 255, math.Round(alpha)))
 
-    -- NPC alerting
     if ct >= self.NextAlertTime then
         local plys = player.GetAll()
         for _, ent in ipairs(ents.GetAll()) do
@@ -439,7 +463,6 @@ function ENT:Think()
         self.NextAlertTime = ct + ALERT_INTERVAL
     end
 
-    -- Tumble physics
     if self.IsTumbling and not self.TumbleCrashed then
         local pos = self:GetPos()
         if pos.z <= (self.TumbleGroundZ or -16384) + 150 then self:CrashExplode(); return end
@@ -456,7 +479,6 @@ function ENT:Think()
 
     local pos = self:GetPos()
 
-    -- Altitude drift
     if ct >= self.AltDriftNextPick then
         self.AltDriftTarget   = self.sky - math.Rand(0, ALT_DRIFT_RANGE)
         self.AltDriftNextPick = ct + math.Rand(12, 30)
@@ -468,7 +490,6 @@ function ENT:Think()
         self.sky - ALT_DRIFT_RANGE, self.sky
     )
 
-    -- Orbit steering
     local flatPos    = Vector(pos.x, pos.y, 0)
     local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
     local toCenter   = flatCenter - flatPos
