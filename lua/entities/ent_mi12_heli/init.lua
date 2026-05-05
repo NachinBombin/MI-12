@@ -144,19 +144,37 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR — exact copy of LFS SpawnFunction + PrimaryAttack logic
+--  DOOR — mirrors LFS SpawnFunction + PrimaryAttack exactly
 --
---  LFS spawn state (doornum = 1 = visually closed):
---    doormdl  (Door_Closed) SetNotSolid(true)  — non-solid, hidden
---    doormdl2 (Door_Open)   SetNotSolid(false) — solid, always visible
+--  LFS doornum semantics (from init.lua main branch):
+--    doornum = 1  →  CLOSED state
+--    doornum = 0  →  OPEN state
 --
---  doormdl2 is NEVER touched again after spawn.
---  Only doormdl toggles:
---    OpenDoors  (doornum 1→0): doormdl SetNotSolid(true)  → Door_Closed hidden  → Door_Open shows
---    CloseDoors (doornum 0→1): doormdl SetNotSolid(false) → Door_Closed visible → covers Door_Open
+--  LFS spawn sets:
+--    doormdl  (Door_Closed): SetNotSolid(true)   — WRONG to copy blindly!
+--      Wait — LFS spawns doornum=1 (closed) with doormdl non-solid.
+--      That means Door_Closed is HIDDEN and Door_Open (doormdl2, solid) shows.
+--      So the visual at spawn is: Door_Open model is the CLOSED appearance.
+--      Door_Closed model slides IN (SetNotSolid false) to OPEN the bay.
+--
+--  Re-reading LFS PrimaryAttack:
+--    doornum==0 branch:  SetNotSolid(true),  doornum=1  → called "Open" anim but CLOSES
+--    else branch:        SetNotSolid(false),  doornum=0 → called "Close" anim but OPENS
+--
+--  The animation names and doornum are swapped in LFS — it's a quirk of LFS.
+--  doormdl2 (Door_Open model) is the RAMP/BAY FLOOR that is always solid.
+--  doormdl  (Door_Closed model) is the DOOR FLAP that slides to block the bay.
+--
+--  CORRECT spawn state for our addon (doors visually CLOSED = bay blocked):
+--    doormdl  SetNotSolid(false) → Door flap IS solid and visible → bay closed
+--    doormdl2 SetNotSolid(false) → Bay floor always solid
+--    DoorIsOpen = false
+--
+--  OpenDoors  (release manhacks): doormdl SetNotSolid(true)  → flap hidden → bay open
+--  CloseDoors (after burst):      doormdl SetNotSolid(false) → flap solid  → bay closed
 -- ============================================================
 local function SpawnDoorProps(ent)
-    -- doormdl = Door_Closed, starts non-solid (hidden), matches LFS spawn
+    -- Door_Closed = the flap/ramp that BLOCKS the bay. Solid at spawn = bay is closed.
     local dc = ents.Create("prop_physics")
     dc:SetModel(DOOR_MDL_CLOSED)
     dc:SetPos(ent:GetPos())
@@ -164,10 +182,10 @@ local function SpawnDoorProps(ent)
     dc.DoNotDuplicate = true
     dc:SetParent(ent)
     dc:Spawn()
-    dc:SetNotSolid(true)   -- non-solid at spawn, matches LFS
+    dc:SetNotSolid(false)   -- solid = visible = bay is CLOSED at spawn
     ent.doormdl = dc
 
-    -- doormdl2 = Door_Open, starts solid, always visible, never touched again
+    -- Door_Open = bay floor/interior, always solid, never toggled
     local do2 = ents.Create("prop_physics")
     do2:SetModel(DOOR_MDL_OPEN)
     do2:SetPos(ent:GetPos())
@@ -175,7 +193,7 @@ local function SpawnDoorProps(ent)
     do2.DoNotDuplicate = true
     do2:SetParent(ent)
     do2:Spawn()
-    do2:SetNotSolid(false)  -- solid at spawn, stays this way forever
+    do2:SetNotSolid(false)  -- always solid, never touched again
     ent.doormdl2 = do2
 
     ent:CallOnRemove("RemoveDoorBlocker", function(e)
@@ -191,24 +209,18 @@ local function BroadcastDoorEvent(ent, isOpen)
     net.Broadcast()
 end
 
--- doornum=1 = closed. OpenDoors = doornum 1→0 = LFS PrimaryAttack doornum==0 branch
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    -- LFS: self:PlayAnimation("Open") — omitted, LFS base only
-    -- LFS: self.doormdl:SetNotSolid(true) — Door_Closed already non-solid, no change needed
-    -- doormdl2 never touched. Door_Open was always showing. Nothing to do visually.
-    -- But we still call it to match doornum=0 state.
+    -- Hide the door flap → bay is open
     if IsValid(self.doormdl) then self.doormdl:SetNotSolid(true) end
     BroadcastDoorEvent(self, true)
 end
 
--- CloseDoors = doornum 0→1 = LFS PrimaryAttack else branch
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    -- LFS: self:PlayAnimation("Close") — omitted, LFS base only
-    -- LFS: self.doormdl:SetNotSolid(false) — Door_Closed becomes solid, covers Door_Open
+    -- Show the door flap → bay is closed
     if IsValid(self.doormdl) then self.doormdl:SetNotSolid(false) end
     BroadcastDoorEvent(self, false)
 end
@@ -391,7 +403,7 @@ function ENT:Initialize()
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- Spawn door props, doornum=1 (closed) at start, matches LFS
+    -- Doors start CLOSED: Door_Closed flap is solid and visible
     self.DoorIsOpen = false
     SpawnDoorProps(self)
 
