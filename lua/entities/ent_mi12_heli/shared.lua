@@ -11,14 +11,21 @@ ENT.Category       = "Bombin Support"
 ENT.Spawnable      = false
 ENT.AdminSpawnable = false
 
--- Model
-ENT.ModelPath    = "models/tfre/vehicles/Mi12_Homer.mdl"
+-- Same model as the LFS vehicle
+ENT.ModelPath = "models/tfre/vehicles/Mi12_Homer.mdl"
+
+-- Door prop models (same TF:RE pack, same folder as main model)
+-- LFS SpawnFunction spawns both as prop_physics parented to the heli.
+-- Door_Closed is solid at spawn (doors shut). Door_Open is non-solid (hidden).
+-- Swap solidity to open/close — exactly as LFS PrimaryAttack does.
+ENT.DoorModelClosed = "models/tfre/vehicles/Mi12_Homer_Door_Closed.mdl"
+ENT.DoorModelOpen   = "models/tfre/vehicles/Mi12_Homer_Door_Open.mdl"
 
 -- Health
-ENT.MaxHP        = 3800
+ENT.MaxHP = 3800
 
 -- Rotor (used by cl_init for bone anim)
-ENT.LimitRPM     = 3000
+ENT.LimitRPM = 3000
 
 -- Flight tuning
 ENT.FadeDuration    = 1.2
@@ -34,13 +41,7 @@ ENT.GibModels = {
     "models/tfre/vehicles/Mi12_Homer_Dead_Wing.mdl",
 }
 
--- Door bodygroup on the main model: index 1, value 0=closed, 1=open
--- There are NO separate door prop models — they never existed in the pack.
-ENT.DoorBodygroupIndex = 1
-ENT.DoorBodygroupOpen  = 1
-ENT.DoorBodygroupClose = 0
-
--- Engine sound (standard GMod sound.Add name, no LFS prefix)
+-- Engine sound
 sound.Add({
     name    = "mi12_engine_loop",
     channel = CHAN_STATIC,

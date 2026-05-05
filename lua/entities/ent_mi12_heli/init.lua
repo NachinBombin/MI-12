@@ -22,11 +22,8 @@ local ALT_DRIFT_RANGE = ENT.AltDriftRange
 local ALT_DRIFT_LERP  = ENT.AltDriftLerp
 local JITTER_AMP      = ENT.JitterAmplitude
 local ALERT_INTERVAL  = ENT.AlertInterval
-
--- Door bodygroup constants (from shared.lua)
-local DOOR_BG_IDX   = ENT.DoorBodygroupIndex  -- 1
-local DOOR_BG_OPEN  = ENT.DoorBodygroupOpen   -- 1
-local DOOR_BG_CLOSE = ENT.DoorBodygroupClose  -- 0
+local DOOR_MDL_CLOSED = ENT.DoorModelClosed
+local DOOR_MDL_OPEN   = ENT.DoorModelOpen
 
 -- ============================================================
 --  FLIGHT CONSTANTS
@@ -147,16 +144,46 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR — bodygroup on Mi12_Homer.mdl
+--  DOOR — exact LFS SpawnFunction / PrimaryAttack pattern
 --
---  Mi12_Homer.mdl has the door baked in as bodygroup index 1:
---    value 0 = door closed (default)
---    value 1 = door open
+--  Two prop_physics are spawned and parented to the heli:
+--    self.doormdl  = Door_Closed.mdl  → solid=true  at spawn (visible, blocking)
+--    self.doormdl2 = Door_Open.mdl    → solid=false at spawn (hidden)
 --
---  The separate Mi12_Homer_Door_Closed.mdl / Door_Open.mdl only
---  exist for the LFS rideable vehicle variant; they are NOT
---  present in this NPC pack and must NOT be spawned as props.
+--  OpenDoors:  doormdl solid=false, doormdl2 solid=true  (matches LFS doornum==0 branch)
+--  CloseDoors: doormdl solid=true,  doormdl2 solid=false (matches LFS else branch)
+--
+--  PlayAnimation("Open"/"Close") is an LFS vehicle base method that
+--  does not exist on base_anim — omitted intentionally. The visual
+--  swap IS the solidity toggle, which is what LFS does too.
 -- ============================================================
+local function SpawnDoorProps(ent)
+    local dc = ents.Create("prop_physics")
+    dc:SetModel(DOOR_MDL_CLOSED)
+    dc:SetPos(ent:GetPos())
+    dc:SetAngles(ent:GetAngles())
+    dc.DoNotDuplicate = true
+    dc:SetParent(ent)
+    dc:Spawn()
+    dc:SetNotSolid(false)   -- solid = closed door visible
+    ent.doormdl = dc
+
+    local do2 = ents.Create("prop_physics")
+    do2:SetModel(DOOR_MDL_OPEN)
+    do2:SetPos(ent:GetPos())
+    do2:SetAngles(ent:GetAngles())
+    do2.DoNotDuplicate = true
+    do2:SetParent(ent)
+    do2:Spawn()
+    do2:SetNotSolid(true)   -- non-solid = open door hidden
+    ent.doormdl2 = do2
+
+    ent:CallOnRemove("RemoveDoorProps", function(e)
+        if IsValid(e.doormdl)  then e.doormdl:Remove()  end
+        if IsValid(e.doormdl2) then e.doormdl2:Remove() end
+    end)
+end
+
 local function BroadcastDoorEvent(ent, isOpen)
     net.Start("MI12_DoorEvent")
         net.WriteEntity(ent)
@@ -167,14 +194,18 @@ end
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_OPEN)
+    -- LFS PrimaryAttack doornum==0 branch
+    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(true)   end
+    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(false)  end
     BroadcastDoorEvent(self, true)
 end
 
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_CLOSE)
+    -- LFS PrimaryAttack else branch
+    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(false)  end
+    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(true)   end
     BroadcastDoorEvent(self, false)
 end
 
@@ -310,7 +341,7 @@ end
 --  SOUND HELPERS
 -- ============================================================
 function ENT:StopAllSounds()
-    if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
+    if self.EngineLoop then self.EngineLoop:Stop(); self.EngineLoop = nil end
 end
 
 function ENT:FadeAndStopSounds(fadeTime)
@@ -335,7 +366,7 @@ function ENT:Initialize()
     local life   = ReadParam(self, "Lifetime",     40)
 
     if dir:LengthSqr() <= 0.01 then dir = Vector(1,0,0) end
-    dir.z = 0 ; dir:Normalize()
+    dir.z = 0; dir:Normalize()
 
     local groundZ = FindGround(center)
     if groundZ == -1 then print("[MI-12] FindGround failed, removing"); self:Remove(); return end
@@ -353,13 +384,12 @@ function ENT:Initialize()
     self:SetColor(Color(255,255,255,0))
     self:SetHealth(MAX_HP)
 
-    -- Rotor blur bodygroups (2 and 3 are the blurred rotor discs)
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- Door starts closed (bodygroup 1 = 0)
+    -- Spawn door props exactly as LFS SpawnFunction does, doors start closed
     self.DoorIsOpen = false
-    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_CLOSE)
+    SpawnDoorProps(self)
 
     local orbitDir = (math.random(2) == 1) and 1 or -1
     local right    = Vector(-dir.y, dir.x, 0)
@@ -517,7 +547,7 @@ function ENT:Think()
 
     local fwdAngle = Angle(0, self.flightYaw, 0)
     local fwd3     = fwdAngle:Forward()
-    local fwd2     = Vector(fwd3.x, fwd3.y, 0) ; fwd2:Normalize()
+    local fwd2     = Vector(fwd3.x, fwd3.y, 0); fwd2:Normalize()
 
     local cross    = fwd2.x * desired2.y - fwd2.y * desired2.x
     local dot      = fwd2.x * desired2.x + fwd2.y * desired2.y
@@ -544,7 +574,7 @@ function ENT:Think()
     newPos.z     = Lerp(0.07, pos.z, liveAlt)
 
     if not util.IsInWorld(newPos) then
-        local toC = flatCenter - flatPos ; toC.z = 0
+        local toC = flatCenter - flatPos; toC.z = 0
         if toC:LengthSqr() < 0.001 then toC = Vector(-fwd2.x, -fwd2.y, 0) end
         toC:Normalize()
         local sCross = fwd2.x * toC.y - fwd2.y * toC.x
@@ -606,7 +636,7 @@ function ENT:StartTumble()
         math.Rand(150,400) * sign()
     )
     local ed = EffectData()
-    ed:SetOrigin(self:GetPos()) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
+    ed:SetOrigin(self:GetPos()); ed:SetScale(4); ed:SetMagnitude(4); ed:SetRadius(400)
     util.Effect("500lb_air", ed, true, true)
     sound.Play("ambient/explosions/explode_4.wav", self:GetPos(), 135, 95, 1.0)
 end
@@ -626,11 +656,11 @@ function ENT:CrashExplode()
     local safePos = FindSafeCrashOrigin(self:GetPos(), self.CenterPos)
     local function boom(origin, sc)
         local ed = EffectData()
-        ed:SetOrigin(origin) ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc*100)
+        ed:SetOrigin(origin); ed:SetScale(sc); ed:SetMagnitude(sc); ed:SetRadius(sc*100)
         util.Effect("500lb_air", ed, true, true)
     end
     local ed1 = EffectData()
-    ed1:SetOrigin(safePos) ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
+    ed1:SetOrigin(safePos); ed1:SetScale(6); ed1:SetMagnitude(6); ed1:SetRadius(600)
     util.Effect("HelicopterMegaBomb", ed1, true, true)
     boom(safePos, 5)
     boom(safePos + Vector(0,0,80),  4)
@@ -648,4 +678,5 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
+    -- door props cleaned up by CallOnRemove("RemoveDoorProps")
 end
