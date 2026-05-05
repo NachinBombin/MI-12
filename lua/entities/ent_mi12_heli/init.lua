@@ -24,14 +24,17 @@ local JITTER_AMP      = ENT.JitterAmplitude
 local ALERT_INTERVAL  = ENT.AlertInterval
 
 -- ============================================================
---  DOOR — bodygroup indices from shared.lua
---  ENT.DoorBodygroupIndex = 1   (which bodygroup controls doors)
---  ENT.DoorBodygroupOpen  = 1   (submodel value = open)
---  ENT.DoorBodygroupClose = 0   (submodel value = closed)
+--  DOOR PROP MODELS
+--  Exact same models used by the original LFS SpawnFunction.
+--  Both props are parented to the heli.
+--  CLOSED state: doormdl  (Door_Closed) solid,   doormdl2 (Door_Open) non-solid
+--  OPEN   state: doormdl  (Door_Closed) non-solid, doormdl2 (Door_Open) solid
+--  (Matches LFS PrimaryAttack solidity logic exactly.)
+--  NOTE: PlayAnimation("Open"/"Close") is an LFS vehicle base method
+--  that does not exist on base_anim — we omit it intentionally.
 -- ============================================================
-local DOOR_BG_IDX    = ENT.DoorBodygroupIndex
-local DOOR_BG_OPEN   = ENT.DoorBodygroupOpen
-local DOOR_BG_CLOSED = ENT.DoorBodygroupClose
+local DOOR_MDL_CLOSED = "models/tfre/vehicles/Mi12_Homer_Door_Closed.mdl"
+local DOOR_MDL_OPEN   = "models/tfre/vehicles/Mi12_Homer_Door_Open.mdl"
 
 -- ============================================================
 --  FLIGHT CONSTANTS
@@ -152,10 +155,38 @@ local function SpawnGibs(origin)
 end
 
 -- ============================================================
---  DOOR — bodygroup toggle + net broadcast
---  base_anim entities use SetBodygroup(), NOT PlayAnimation().
---  PlayAnimation() is LFS-only and does not exist here.
+--  DOOR — prop pair, exact LFS SpawnFunction pattern
 -- ============================================================
+local function SpawnDoorProps(ent)
+    -- doormdl = Closed model (solid at start = doors closed)
+    local dc = ents.Create("prop_physics")
+    dc:SetModel(DOOR_MDL_CLOSED)
+    dc:SetPos(ent:GetPos())
+    dc:SetAngles(ent:GetAngles())
+    dc.DoNotDuplicate = true
+    dc:SetParent(ent)
+    dc:Spawn()
+    dc:SetNotSolid(false)   -- solid = visible / closed state
+    ent.doormdl = dc
+
+    -- doormdl2 = Open model (non-solid at start = hidden)
+    local do2 = ents.Create("prop_physics")
+    do2:SetModel(DOOR_MDL_OPEN)
+    do2:SetPos(ent:GetPos())
+    do2:SetAngles(ent:GetAngles())
+    do2.DoNotDuplicate = true
+    do2:SetParent(ent)
+    do2:Spawn()
+    do2:SetNotSolid(true)   -- non-solid = hidden / open state
+    ent.doormdl2 = do2
+
+    -- Same cleanup hook as LFS CallOnRemove
+    ent:CallOnRemove("RemoveDoorProps", function(e)
+        if IsValid(e.doormdl)  then e.doormdl:Remove()  end
+        if IsValid(e.doormdl2) then e.doormdl2:Remove() end
+    end)
+end
+
 local function BroadcastDoorEvent(ent, isOpen)
     net.Start("MI12_DoorEvent")
         net.WriteEntity(ent)
@@ -166,14 +197,18 @@ end
 function ENT:OpenDoors()
     if self.DoorIsOpen then return end
     self.DoorIsOpen = true
-    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_OPEN)
+    -- LFS PrimaryAttack (doornum==0 branch): doormdl goes non-solid
+    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(true)  end
+    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(false) end
     BroadcastDoorEvent(self, true)
 end
 
 function ENT:CloseDoors()
     if not self.DoorIsOpen then return end
     self.DoorIsOpen = false
-    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_CLOSED)
+    -- LFS PrimaryAttack (else branch): doormdl goes solid again
+    if IsValid(self.doormdl)  then self.doormdl:SetNotSolid(false) end
+    if IsValid(self.doormdl2) then self.doormdl2:SetNotSolid(true)  end
     BroadcastDoorEvent(self, false)
 end
 
@@ -357,9 +392,9 @@ function ENT:Initialize()
     self:SetBodygroup(2, 1)
     self:SetBodygroup(3, 1)
 
-    -- Doors start closed
+    -- Spawn door prop pair, doors start closed
     self.DoorIsOpen = false
-    self:SetBodygroup(DOOR_BG_IDX, DOOR_BG_CLOSED)
+    SpawnDoorProps(self)
 
     local orbitDir = (math.random(2) == 1) and 1 or -1
     local right    = Vector(-dir.y, dir.x, 0)
@@ -648,4 +683,5 @@ end
 function ENT:OnRemove()
     self:StopAllSounds()
     self:StopManhackSystem()
+    -- door props cleaned up by CallOnRemove("RemoveDoorProps") hook
 end
