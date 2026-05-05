@@ -15,29 +15,31 @@ ENT.AdminSpawnable = false
 ENT.ModelPath      = "models/tfre/vehicles/Mi12_Homer.mdl"
 
 -- ─── Sound ────────────────────────────────────────────────
--- Stereo loop; ^ prefix = positional stereo in GMod
 ENT.EngineSound    = "^lfs/tfre_mi12/engine.wav"
 
 -- ─── Health & Damage ──────────────────────────────────────
 ENT.MaxHP          = 3800
 
 -- ─── Rotor ────────────────────────────────────────────────
-ENT.LimitRPM       = 3000    -- RPM at which rotor is at 100% disc blur
-ENT.IdleRPM        = 700     -- RPM below which blades droop (we never go here)
+ENT.LimitRPM       = 3000
+ENT.IdleRPM        = 700
 
 -- ─── Physics ──────────────────────────────────────────────
 ENT.Mass           = 15000
 
 -- ─── Flight tuning ────────────────────────────────────────
-ENT.FadeDuration   = 4.0     -- seconds to fade in on spawn
-ENT.AltDriftRange  = 40      -- HU amplitude of altitude sine-drift
-ENT.AltDriftLerp   = 0.015   -- smoothing toward target altitude
-ENT.JitterAmplitude= 2.5     -- per-tick altitude noise
-ENT.AlertInterval  = 18      -- seconds between NPC alert pulses
+-- Movement is driven from Think() via SetPos/SetAngles (MOVETYPE_NONE).
+-- PhysicsUpdate is NOT used because MOVETYPE_NOCLIP/NONE with SOLID_NONE
+-- never fires PhysicsUpdate callbacks in GMod.
+ENT.FadeDuration    = 1.2    -- seconds to fade in (was 4.0 — too slow)
+ENT.AltDriftRange   = 40     -- HU amplitude of altitude sine-drift
+ENT.AltDriftLerp    = 0.015  -- smoothing factor per Think tick
+ENT.JitterAmplitude = 2.5    -- per-tick altitude noise
+ENT.AlertInterval   = 18
 
--- ─── Rotor geometry (Mi-12 Homer mesh) ───────────────────
-ENT.RotorPos       = Vector(95.991, 0, 390.62)  -- local center between both rotors
-ENT.RotorRadius    = 710                         -- HU tip-to-center on each rotor
+-- ─── Rotor geometry ───────────────────────────────────────
+ENT.RotorPos    = Vector(95.991, 0, 390.62)
+ENT.RotorRadius = 710
 
 -- ─── Gib models ───────────────────────────────────────────
 ENT.GibModels = {
@@ -50,7 +52,7 @@ ENT.GibModels = {
 ENT.DoorModelClosed = "models/tfre/vehicles/Mi12_Homer_Door_Closed.mdl"
 ENT.DoorModelOpen   = "models/tfre/vehicles/Mi12_Homer_Door_Open.mdl"
 
--- ─── Sound registration (runs on both realms) ─────────────
+-- ─── Sound registration ───────────────────────────────────
 if not sound.GetProperties("tfre_mi12") then
     sound.Add({
         name    = "tfre_mi12",
