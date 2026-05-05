@@ -11,145 +11,325 @@ include("shared.lua")
 util.AddNetworkString("bombin_mi12_damage_tier")
 
 -- ============================================================
---  CACHE SHARED CONSTANTS
---  ENT global is only valid during file execution, not at
---  method call time. Cache everything here.
+--  CACHE SHARED CONSTANTS (ENT global dies after file exec)
 -- ============================================================
 local MODEL_PATH      = ENT.ModelPath
 local DOOR_MDL_CLOSED = ENT.DoorModelClosed
 local DOOR_MDL_OPEN   = ENT.DoorModelOpen
 local GIB_MODELS      = ENT.GibModels
 local MAX_HP          = ENT.MaxHP
-local ENT_MASS        = ENT.Mass
 local FADE_DURATION   = ENT.FadeDuration
 local ALT_DRIFT_RANGE = ENT.AltDriftRange
 local ALT_DRIFT_LERP  = ENT.AltDriftLerp
 local JITTER_AMP      = ENT.JitterAmplitude
+local ALERT_INTERVAL  = ENT.AlertInterval
+
+-- ============================================================
+--  FLIGHT CONSTANTS
+-- ============================================================
+local PASS_SOUND_A = "vehicles/apc/apc_engine_start.wav"
+local PASS_SOUND_B = "vehicles/apc/apc_idle1.wav"
+
+local MODEL_YAW_OFFSET    = 0       -- Mi-12 model faces +X natively
+local ROLL_SUSTAINED_GAIN = 1.8
+local ROLL_TRANSIENT_GAIN = 45.0
+local ROLL_MAX            = 18.0
+local ROLL_LERP_IN        = 0.06
+local ROLL_LERP_OUT       = 0.01
+local GIB_LIFETIME        = 40
+
+local TWO_PI = math.pi * 2
 
 -- ============================================================
 --  HELPERS
 -- ============================================================
-local TWO_PI = math.pi * 2
-
-local function RandomFlatDir()
-    local a = math.Rand(0, TWO_PI)
-    return Vector(math.cos(a), math.sin(a), 0)
+local PROBE_DIRS   = {}
+for i = 0, 7 do
+    local a = math.rad(i * 45)
+    PROBE_DIRS[i+1] = Vector(math.cos(a), math.sin(a), 0)
 end
+local PROBE_DIST   = 8192
+local PROBE_MARGIN = 300
 
-local function ProbeOrbitRadius(center, requestedRadius, skyZ)
-    local radius = requestedRadius
-    for i = 0, 7 do
-        local a   = (i / 8) * TWO_PI
-        local dir = Vector(math.cos(a), math.sin(a), 0)
-        local tr  = util.TraceLine({
-            start  = Vector(center.x, center.y, skyZ),
-            endpos = Vector(center.x + dir.x * radius, center.y + dir.y * radius, skyZ),
+local function ProbeOrbitRadius(centerPos, skyZ, requestedRadius)
+    local origin  = Vector(centerPos.x, centerPos.y, skyZ)
+    local minDist = PROBE_DIST
+    for _, dir in ipairs(PROBE_DIRS) do
+        local tr = util.TraceLine({
+            start  = origin,
+            endpos = origin + dir * PROBE_DIST,
             mask   = MASK_SOLID_BRUSHONLY,
         })
         if tr.Hit then
-            local safe = (tr.HitPos - Vector(center.x, center.y, skyZ)):Length() * 0.85
-            radius = math.min(radius, safe)
+            local d = (tr.HitPos - origin):Length2D()
+            if d < minDist then minDist = d end
         end
     end
-    return math.max(radius, 400)
+    local safe = math.max(200, minDist - PROBE_MARGIN)
+    return math.min(requestedRadius, safe)
 end
 
-local function SkyHeight(pos, desiredAdd)
-    local tr = util.TraceLine({
-        start  = pos + Vector(0, 0, 64),
-        endpos = pos + Vector(0, 0, desiredAdd + 3000),
-        mask   = MASK_SOLID_BRUSHONLY,
-    })
-    local ceiling = tr.Hit and (tr.HitPos.z - 120) or (pos.z + desiredAdd + 200)
-    return math.min(pos.z + desiredAdd, ceiling)
+-- Downward raycast to find real ground Z, then return ground + offset.
+-- Returns -1 if no world surface found (caller must handle).
+local function FindGround(centerPos)
+    local startPos   = Vector(centerPos.x, centerPos.y, centerPos.z + 64)
+    local endPos     = Vector(centerPos.x, centerPos.y, -16384)
+    local filterList = {}
+    local trace      = { start = startPos, endpos = endPos, filter = filterList }
+    for _ = 1, 100 do
+        local tr = util.TraceLine(trace)
+        if tr.HitWorld then return tr.HitPos.z end
+        if IsValid(tr.Entity) then
+            table.insert(filterList, tr.Entity)
+        else
+            break
+        end
+    end
+    return -1
+end
+
+local function SeedRelationship(npc)
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) then
+            npc:AddEntityRelationship(ply, D_HT, 99)
+        end
+    end
+end
+
+local function FindSafeCrashOrigin(rawPos, centerPos)
+    if util.IsInWorld(rawPos) then return rawPos end
+    local target = Vector(centerPos.x, centerPos.y, rawPos.z)
+    local dir    = target - rawPos
+    local dist   = dir:Length()
+    if dist < 1 then
+        local c = Vector(centerPos.x, centerPos.y, rawPos.z)
+        return util.IsInWorld(c) and c or centerPos
+    end
+    dir = dir / dist
+    for i = 1, math.ceil(dist / 200) do
+        local c = rawPos + dir * (i * 200)
+        if util.IsInWorld(c) then return c end
+    end
+    local c = Vector(centerPos.x, centerPos.y, rawPos.z)
+    return util.IsInWorld(c) and c or centerPos
+end
+
+local function SpawnGibs(origin, center)
+    for idx, mdl in ipairs(GIB_MODELS) do
+        timer.Simple((idx - 1) * 0.1, function()
+            local pos = origin + Vector(
+                math.Rand(-150, 150),
+                math.Rand(-150, 150),
+                math.Rand(  20, 100)
+            )
+            if not util.IsInWorld(pos) then pos = origin end
+
+            local gib = ents.Create("prop_physics")
+            if not IsValid(gib) then return end
+            gib:SetModel(mdl)
+            gib:SetPos(pos)
+            gib:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
+            gib:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
+            gib:Spawn()
+            gib:Activate()
+
+            local ph = gib:GetPhysicsObject()
+            if IsValid(ph) then
+                ph:SetMass(2000)
+                ph:SetDragCoefficient(0)
+                ph:SetAngleDragCoefficient(0)
+                ph:EnableGravity(true)
+                ph:Wake()
+                ph:ApplyForceCenter(Vector(
+                    math.Rand(-400, 400),
+                    math.Rand(-400, 400),
+                    math.Rand( 300, 900)
+                ) * 2000)
+                ph:ApplyTorqueCenter(Vector(
+                    math.Rand(-2000, 2000),
+                    math.Rand(-2000, 2000),
+                    math.Rand(-2000, 2000)
+                ))
+            end
+
+            -- Defer Ignite one tick so the fire system is fully ready
+            timer.Simple(0, function()
+                if IsValid(gib) then gib:Ignite(GIB_LIFETIME, 0) end
+            end)
+
+            timer.Simple(GIB_LIFETIME, function()
+                if IsValid(gib) then gib:Remove() end
+            end)
+        end)
+    end
+end
+
+-- ============================================================
+--  SOUND HELPERS
+-- ============================================================
+function ENT:StopAllSounds()
+    if self.EngineLoop then self.EngineLoop:Stop() self.EngineLoop = nil end
+    if self.PassSoundA  then self.PassSoundA:Stop()  self.PassSoundA  = nil end
+    if self.PassSoundB  then self.PassSoundB:Stop()  self.PassSoundB  = nil end
+end
+
+function ENT:FadeAndStopSounds(fadeTime)
+    local t = fadeTime or 0.5
+    local e, a, b = self.EngineLoop, self.PassSoundA, self.PassSoundB
+    self.EngineLoop, self.PassSoundA, self.PassSoundB = nil, nil, nil
+    if e then e:ChangeVolume(0, t) end
+    if a then a:ChangeVolume(0, t) end
+    if b then b:ChangeVolume(0, t) end
+    timer.Simple(t + 0.15, function()
+        if e then e:Stop() end
+        if a then a:Stop() end
+        if b then b:Stop() end
+    end)
 end
 
 -- ============================================================
 --  ENT:Initialize
 -- ============================================================
 function ENT:Initialize()
-    self:SetModel(MODEL_PATH)
-
-    -- MOVETYPE_NONE: we drive all movement manually from Think.
-    -- PhysicsUpdate does NOT fire for MOVETYPE_NOCLIP/NONE in GMod.
-    self:SetMoveType(MOVETYPE_NONE)
-
-    -- SOLID_BBOX is required for OnTakeDamage to receive hits.
-    -- SOLID_NONE causes bullets and explosions to pass through entirely.
-    self:SetSolid(SOLID_BBOX)
-    self:SetCollisionBounds(Vector(-350, -700, -80), Vector(350, 700, 420))
-
-    -- IN_VEHICLE: players walk through the hull, but damage traces still land.
-    self:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
-    self:DrawShadow(false)
-    self:SetHealth(MAX_HP)
-
-    -- Retrieve spawn params
+    -- Grab spawn params first
     local center = self:GetVar("CenterPos",    self:GetPos())
-    local dir    = self:GetVar("CallDir",      RandomFlatDir())
+    local dir    = self:GetVar("CallDir",      Vector(1, 0, 0))
     local speed  = self:GetVar("Speed",        280)
     local radius = self:GetVar("OrbitRadius",  3000)
     local skyAdd = self:GetVar("SkyHeightAdd", 5000)
     local life   = self:GetVar("Lifetime",     40)
 
-    local skyZ = SkyHeight(center, skyAdd)
-    radius     = ProbeOrbitRadius(center, radius, skyZ)
+    if dir:LengthSqr() <= 0.01 then dir = Vector(1, 0, 0) end
+    dir.z = 0 ; dir:Normalize()
 
-    -- Entry position: tangent to the orbit circle
-    local perp = Vector(-dir.y, dir.x, 0)
-    self:SetPos(Vector(
-        center.x + perp.x * radius,
-        center.y + perp.y * radius,
-        skyZ
-    ))
+    -- Real ground + offset for sky altitude
+    local groundZ = FindGround(center)
+    if groundZ == -1 then
+        print("[MI-12] FindGround failed, removing")
+        self:Remove() return
+    end
+    local skyZ = groundZ + skyAdd
 
-    -- Flight state
-    self.orbitCenter  = Vector(center.x, center.y, skyZ)
-    self.orbitRadius  = radius
-    self.orbitSpeed   = speed
-    self.orbitAngle   = math.atan2(perp.y, perp.x)
-    self.angularVel   = speed / radius
-    self.targetAlt    = skyZ
-    self.currentAlt   = skyZ
-    self.prevAlt      = skyZ
-    self.altPhase     = math.Rand(0, TWO_PI)
-    self.HP           = MAX_HP
-    self.dmgTier      = 0
-    self.isTumbling   = false
-    self.tumbleVel    = Vector(0, 0, 0)
-    self.tumbleAV     = Angle(0, 0, 0)
-    self.fadeAlpha    = 0
-    self.currentBank  = 0
-    self.currentPitch = 0
-    self.spawnTime    = CurTime()
-    self.lifetime     = life
+    radius = ProbeOrbitRadius(center, skyZ, radius)
 
+    self:SetModel(MODEL_PATH)
+    self:SetMoveType(MOVETYPE_NONE)
+    -- SOLID_BBOX required: OnTakeDamage only fires when traces hit a hull
+    self:SetSolid(SOLID_BBOX)
+    self:SetCollisionBounds(Vector(-350, -700, -80), Vector(350, 700, 420))
+    -- IN_VEHICLE: players walk through, damage traces still land
+    self:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
+    self:DrawShadow(false)
     self:SetRenderMode(RENDERMODE_TRANSALPHA)
     self:SetColor(Color(255, 255, 255, 0))
+    self:SetHealth(MAX_HP)
 
-    self:SpawnDoors()
+    -- Entry position: tangent to orbit circle
+    local right   = Vector(-dir.y, dir.x, 0)
+    local orbitDir = (math.random(2) == 1) and 1 or -1
+    local tangent = Vector(right.x * orbitDir, right.y * orbitDir, 0)
+    tangent:Normalize()
+    local spawnOffset = tangent * (-radius * math.Rand(0.55, 0.95))
+    local spawnPos    = Vector(
+        center.x + spawnOffset.x,
+        center.y + spawnOffset.y,
+        skyZ
+    )
+    if not util.IsInWorld(spawnPos) then
+        spawnPos = Vector(center.x, center.y, skyZ)
+    end
+    if not util.IsInWorld(spawnPos) then
+        print("[MI-12] Spawn OOB, removing")
+        self:Remove() return
+    end
+    self:SetPos(spawnPos)
+
+    -- Flight state
+    self.CenterPos      = Vector(center.x, center.y, skyZ)
+    self.OrbitRadius    = radius
+    self.OrbitDirection = orbitDir
+    self.Speed          = speed
+    self.sky            = skyZ
+    self.SpawnTime      = CurTime()
+    self.DieTime        = CurTime() + life
+    self.NextAlertTime  = CurTime()
+    self.IsDestroyed    = false
+    self.DamageTier     = 0
+    self.HP             = MAX_HP
+    self.fadeAlpha      = 0
+
+    self.flightYaw       = tangent:Angle().y
+    self.PrevFlightYaw   = self.flightYaw
+    self.ang             = Angle(0, self.flightYaw + MODEL_YAW_OFFSET, 0)
+    self.SmoothedRoll    = 0
+    self.SmoothedPitch   = 0
+    self.PrevTurnRate    = 0
+    self.RadialGain      = 0.5
+    self.MaxTurnRate     = 22
+
+    self.AltDriftCurrent  = skyZ
+    self.AltDriftTarget   = skyZ
+    self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
+    self.JitterPhase      = math.Rand(0, TWO_PI)
+
+    self.IsTumbling        = false
+    self.TumbleCrashed     = false
+    self.TumbleGroundZ     = groundZ
+    self.TumbleVelocity    = Vector(0, 0, 0)
+    self.TumbleAngVelocity = Vector(0, 0, 0)
 
     self:SetBodygroup(1, 0)  -- no AI seat
     self:SetBodygroup(2, 1)  -- rotor A: blur disc
     self:SetBodygroup(3, 1)  -- rotor B: blur disc
 
-    self.engineSound = CreateSound(self, "tfre_mi12")
-    if self.engineSound then
-        self.engineSound:Play()
-        self.engineSound:ChangePitch(110, 0)
-        self.engineSound:ChangeVolume(1.0, 0.5)
+    self:SpawnDoors()
+
+    -- Seed NPC relationships
+    for _, ent in ipairs(ents.GetAll()) do
+        if IsValid(ent) and ent:IsNPC() then SeedRelationship(ent) end
+    end
+    hook.Add("OnEntityCreated", "mi12_relationship_hook_" .. self:EntIndex(), function(ent)
+        if IsValid(ent) and ent:IsNPC() then
+            timer.Simple(0, function() if IsValid(ent) then SeedRelationship(ent) end end)
+        end
+    end)
+
+    -- Engine sound
+    self.EngineLoop = CreateSound(self, "tfre_mi12")
+    if self.EngineLoop then
+        self.EngineLoop:SetSoundLevel(80)
+        self.EngineLoop:ChangePitch(110, 0)
+        self.EngineLoop:ChangeVolume(1.0, 0.5)
+        self.EngineLoop:Play()
+    end
+    -- Pass-by sounds (positional ambience around the heli)
+    self.PassSoundA = CreateSound(self, PASS_SOUND_A)
+    if self.PassSoundA then
+        self.PassSoundA:SetSoundLevel(85)
+        self.PassSoundA:ChangePitch(90, 0)
+        self.PassSoundA:ChangeVolume(0.5, 0)
+        self.PassSoundA:Play()
+    end
+    self.PassSoundB = CreateSound(self, PASS_SOUND_B)
+    if self.PassSoundB then
+        self.PassSoundB:SetSoundLevel(80)
+        self.PassSoundB:ChangePitch(85, 0)
+        self.PassSoundB:ChangeVolume(0.35, 0)
+        self.PassSoundB:Play()
     end
 
-    -- Think must be explicitly scheduled for the first call
-    self:NextThink(CurTime())
+    self:SetNWInt("HP",    MAX_HP)
+    self:SetNWInt("MaxHP", MAX_HP)
 
     timer.Simple(life, function()
-        if IsValid(self) then self:DestroyHeli() end
+        if IsValid(self) then self:Remove() end
     end)
+
+    self:NextThink(CurTime())
 end
 
 -- ============================================================
---  DOORS — always open, never toggled
+--  DOORS
 -- ============================================================
 function ENT:SpawnDoors()
     local function MakeDoor(mdl, hidden)
@@ -166,177 +346,273 @@ function ENT:SpawnDoors()
         if IsValid(ph) then ph:EnableMotion(false) end
         return d
     end
-
-    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, true)   -- hidden
-    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   false)  -- visible
+    self.doorClosed = MakeDoor(DOOR_MDL_CLOSED, true)
+    self.doorOpen   = MakeDoor(DOOR_MDL_OPEN,   false)
 end
 
 -- ============================================================
---  Think — ALL movement + fade + tumble
+--  Think — fade + NPC alerts + tumble ground check
+--  ALL movement is done here (MOVETYPE_NONE, no PhysicsUpdate)
 -- ============================================================
 function ENT:Think()
+    if not self.DieTime or not self.SpawnTime then
+        self:NextThink(CurTime() + 0.1)
+        return true
+    end
+
     local ct = CurTime()
     local dt = FrameTime()
     if dt <= 0 then dt = 0.01 end
 
-    -- ─── Fade in ──────────────────────────────────────
-    if self.fadeAlpha < 255 then
-        self.fadeAlpha = math.min(255, self.fadeAlpha + (255 / FADE_DURATION) * dt)
-        self:SetColor(Color(255, 255, 255, math.floor(self.fadeAlpha)))
+    -- ── Fade in / fade out ───────────────────────────────
+    local age  = ct - self.SpawnTime
+    local left = self.DieTime - ct
+    local alpha
+    if age < FADE_DURATION then
+        alpha = math.Clamp(255 * (age  / FADE_DURATION), 0, 255)
+    elseif left < FADE_DURATION then
+        alpha = math.Clamp(255 * (left / FADE_DURATION), 0, 255)
+    else
+        alpha = 255
+    end
+    self:SetColor(Color(255, 255, 255, math.Round(alpha)))
+
+    -- ── NPC alert pulse ────────────────────────────────
+    if ct >= self.NextAlertTime then
+        local plys = player.GetAll()
+        for _, ent in ipairs(ents.GetAll()) do
+            if IsValid(ent) and ent:IsNPC() and ent.UpdateEnemyMemory then
+                for _, ply in ipairs(plys) do
+                    if IsValid(ply) and ply:Alive() then
+                        ent:UpdateEnemyMemory(ply, ply:GetPos())
+                    end
+                end
+            end
+        end
+        self.NextAlertTime = ct + ALERT_INTERVAL
     end
 
-    -- ─── Tumble mode ─────────────────────────────────
-    if self.isTumbling then
-        -- Apply gravity manually
-        self.tumbleVel = self.tumbleVel + Vector(0, 0, -600 * dt)
-
-        local newPos = self:GetPos() + self.tumbleVel * dt
-        local newAng = self:GetAngles() + self.tumbleAV * dt
-
-        -- Ground hit detection
+    -- ── Tumble mode ──────────────────────────────────
+    if self.IsTumbling and not self.TumbleCrashed then
+        local pos     = self:GetPos()
+        local groundZ = self.TumbleGroundZ or -16384
+        if pos.z <= groundZ + 150 then self:CrashExplode() return end
         local tr = util.TraceLine({
-            start  = self:GetPos(),
-            endpos = newPos - Vector(0, 0, 60),
+            start  = pos,
+            endpos = pos + Vector(0, 0, -200),
             filter = self,
-            mask   = MASK_SOLID_BRUSHONLY,
         })
-        if tr.Hit then
-            self:CrashExplode()
-            return
-        end
-
-        self:SetPos(newPos)
-        self:SetAngles(newAng)
+        if tr.HitWorld then self:CrashExplode() return end
+        -- Integrate tumble in Think
+        local grav = physenv.GetGravity().z
+        self.TumbleVelocity.z = self.TumbleVelocity.z + grav * dt
+        local av = self.TumbleAngVelocity
+        self.ang = Angle(
+            self.ang.p + av.x * dt,
+            self.ang.y + av.y * dt,
+            self.ang.r + av.z * dt
+        )
+        self:SetPos(pos + self.TumbleVelocity * dt)
+        self:SetAngles(self.ang)
         self:NextThink(ct)
         return true
     end
 
-    -- ─── Orbit flight ────────────────────────────────
-    self.orbitAngle = self.orbitAngle + self.angularVel * dt
-    if self.orbitAngle > TWO_PI then self.orbitAngle = self.orbitAngle - TWO_PI end
-
-    local cx = self.orbitCenter.x
-    local cy = self.orbitCenter.y
-    local tx = cx + math.cos(self.orbitAngle) * self.orbitRadius
-    local ty = cy + math.sin(self.orbitAngle) * self.orbitRadius
+    -- ── Orbit flight (ported from AN-71 PhysicsUpdate) ────────
+    local pos = self:GetPos()
 
     -- Altitude drift
-    self.altPhase   = self.altPhase + dt * 0.18
-    local altTarget = self.targetAlt
-        + math.sin(self.altPhase) * ALT_DRIFT_RANGE
-        + math.Rand(-1, 1) * JITTER_AMP
-    self.currentAlt = Lerp(ALT_DRIFT_LERP, self.currentAlt, altTarget)
+    if ct >= self.AltDriftNextPick then
+        self.AltDriftTarget   = self.sky - math.Rand(0, ALT_DRIFT_RANGE)
+        self.AltDriftNextPick = ct + math.Rand(12, 30)
+    end
+    self.AltDriftCurrent = Lerp(ALT_DRIFT_LERP, self.AltDriftCurrent, self.AltDriftTarget)
+    self.JitterPhase     = self.JitterPhase + 0.02
+    local liveAlt = math.Clamp(
+        self.AltDriftCurrent + math.sin(self.JitterPhase) * JITTER_AMP,
+        self.sky - ALT_DRIFT_RANGE,
+        self.sky
+    )
 
-    local newPos = Vector(tx, ty, self.currentAlt)
+    -- Radial-error PID steering (same as AN-71)
+    local flatPos    = Vector(pos.x, pos.y, 0)
+    local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
+    local toCenter   = flatCenter - flatPos
+    local dist       = toCenter:Length()
+    local radialDir  = (dist > 1) and (toCenter / dist) or Vector(0, 0, 0)
 
-    -- OOB clamp
-    if (newPos - self.orbitCenter):Length2D() > self.orbitRadius * 1.2 then
-        local clampDir = (newPos - self.orbitCenter):GetNormalized()
-        newPos = self.orbitCenter + clampDir * self.orbitRadius
-        newPos.z = self.currentAlt
+    local tangentDir = Vector(
+        -radialDir.y * self.OrbitDirection,
+         radialDir.x * self.OrbitDirection,
+        0
+    )
+    if tangentDir:LengthSqr() < 0.001 then
+        tangentDir = Angle(0, self.flightYaw, 0):Forward()
+        tangentDir.z = 0
+    end
+    tangentDir:Normalize()
+
+    local radialError = 0
+    if self.OrbitRadius > 0 then
+        radialError = math.Clamp((dist - self.OrbitRadius) / self.OrbitRadius, -1, 1)
     end
 
-    -- Yaw: face tangent
-    local yawDeg = math.deg(self.orbitAngle + math.pi * 0.5)
+    local desired2 = Vector(
+        tangentDir.x + radialDir.x * radialError * self.RadialGain,
+        tangentDir.y + radialDir.y * radialError * self.RadialGain,
+        0
+    )
+    if desired2:LengthSqr() < 0.001 then desired2 = tangentDir end
+    desired2:Normalize()
 
-    -- Bank
-    self.currentBank  = Lerp(0.04, self.currentBank, -22)
+    local fwdAngle = Angle(0, self.flightYaw, 0)
+    local fwd3     = fwdAngle:Forward()
+    local fwd2     = Vector(fwd3.x, fwd3.y, 0) ; fwd2:Normalize()
 
-    -- Pitch
-    local altDelta    = self.currentAlt - self.prevAlt
-    self.prevAlt      = self.currentAlt
-    self.currentPitch = Lerp(0.06, self.currentPitch, math.Clamp(-altDelta * 0.6, -12, 12))
+    local cross    = fwd2.x * desired2.y - fwd2.y * desired2.x
+    local dot      = fwd2.x * desired2.x + fwd2.y * desired2.y
+    local urgency  = (1 - dot) * 0.5
+    local turnRate = math.Clamp(cross * urgency * self.MaxTurnRate * 2,
+                                -self.MaxTurnRate, self.MaxTurnRate)
+
+    self.flightYaw = self.flightYaw + turnRate * dt
+
+    -- Roll: sustained (from turnRate) + transient (from rate-of-change)
+    local turnRateDelta = turnRate - self.PrevTurnRate
+    self.PrevTurnRate   = turnRate
+    local sustained     = math.Clamp(turnRate      * ROLL_SUSTAINED_GAIN, -ROLL_MAX, ROLL_MAX)
+    local transient     = math.Clamp(turnRateDelta * ROLL_TRANSIENT_GAIN, -12, 12)
+    local rollTarget    = math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
+    local building      = (rollTarget * self.SmoothedRoll >= 0)
+                          and (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
+    self.SmoothedRoll   = Lerp(building and ROLL_LERP_IN or ROLL_LERP_OUT, self.SmoothedRoll, rollTarget)
+
+    -- Pitch: from altitude correction delta
+    local climbDelta    = math.Clamp((liveAlt - pos.z) / 400, -1, 1)
+    self.SmoothedPitch  = Lerp(0.03, self.SmoothedPitch, math.Clamp(climbDelta * 6, -8, 8))
+
+    self.ang = Angle(
+        self.SmoothedPitch,
+        self.flightYaw + MODEL_YAW_OFFSET,
+        self.SmoothedRoll
+    )
+
+    local newPos = pos + fwdAngle:Forward() * self.Speed * dt
+    newPos.z     = Lerp(0.07, pos.z, liveAlt)
+
+    -- OOB guard: steer back toward center if out of world
+    if not util.IsInWorld(newPos) then
+        local toC = flatCenter - flatPos
+        toC.z = 0
+        if toC:LengthSqr() < 0.001 then toC = Vector(-fwd2.x, -fwd2.y, 0) end
+        toC:Normalize()
+        local sCross = fwd2.x * toC.y - fwd2.y * toC.x
+        self.flightYaw = self.flightYaw
+            + math.Clamp(sCross * self.MaxTurnRate, -self.MaxTurnRate, self.MaxTurnRate) * dt
+        self:SetAngles(Angle(self.SmoothedPitch, self.flightYaw + MODEL_YAW_OFFSET, self.SmoothedRoll))
+        self:NextThink(ct)
+        return true
+    end
 
     self:SetPos(newPos)
-    self:SetAngles(Angle(self.currentPitch, yawDeg, self.currentBank))
+    self:SetAngles(self.ang)
 
-    -- Run every tick during flight
     self:NextThink(ct)
     return true
 end
 
 -- ============================================================
---  Damage — requires SOLID_BBOX to receive hits
+--  Damage — requires SOLID_BBOX
 -- ============================================================
 function ENT:OnTakeDamage(dmginfo)
-    self.HP = math.max(0, self.HP - dmginfo:GetDamage())
+    if self.IsDestroyed then return end
+    if dmginfo:IsDamageType(DMG_CRUSH) then return end
+
+    self.HP = self.HP - dmginfo:GetDamage()
+    self:SetNWInt("HP", self.HP)
 
     local pct  = self.HP / MAX_HP
-    local tier = (pct > 0.65) and 0
-             or (pct > 0.35)  and 1
-             or (pct > 0.10)  and 2
+    local tier = (pct > 0.66) and 0
+             or (pct > 0.33)  and 1
+             or (self.HP > 0) and 2
              or 3
 
-    if tier ~= self.dmgTier then
-        self.dmgTier = tier
+    if tier ~= self.DamageTier then
+        self.DamageTier = tier
         net.Start("bombin_mi12_damage_tier")
-        net.WriteUInt(self:EntIndex(), 16)
-        net.WriteUInt(tier, 2)
+            net.WriteUInt(self:EntIndex(), 16)
+            net.WriteUInt(tier, 2)
         net.Broadcast()
     end
 
-    if self.HP <= 0 and not self.isTumbling then
-        self:DestroyHeli()
-    end
+    if self.HP <= 0 then self:DestroyHeli() end
 end
 
 -- ============================================================
 --  Destruction chain
 -- ============================================================
-function ENT:DestroyHeli()
-    if self.isTumbling then return end
-    self.isTumbling = true
+function ENT:StartTumble()
+    self.IsTumbling    = true
+    self.TumbleCrashed = false
 
-    if self.engineSound then
-        self.engineSound:ChangeVolume(0, 1.5)
-        timer.Simple(1.5, function()
-            if self.engineSound then self.engineSound:Stop() end
-        end)
-    end
+    local gnd = FindGround(self:GetPos())
+    if gnd ~= -1 then self.TumbleGroundZ = gnd end
+
+    -- Seed velocity from current flight direction, not random
+    local travelFwd = Angle(0, self.flightYaw, 0):Forward()
+    local spd       = self.Speed or 280
+    self.TumbleVelocity    = Vector(travelFwd.x * spd, travelFwd.y * spd, -200)
+    local sign = function() return (math.random(2) == 1) and 1 or -1 end
+    self.TumbleAngVelocity = Vector(
+        math.Rand( 80, 200) * sign(),
+        math.Rand( 20,  80) * sign(),
+        math.Rand(150, 400) * sign()
+    )
+
+    -- Tumble start FX (matches AN-71)
+    local ed = EffectData()
+    ed:SetOrigin(self:GetPos()) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
+    util.Effect("500lb_air", ed, true, true)
+    sound.Play("ambient/explosions/explode_4.wav", self:GetPos(), 135, 95, 1.0)
+end
+
+function ENT:DestroyHeli()
+    if self.IsDestroyed then return end
+    self.IsDestroyed = true
 
     if IsValid(self.doorClosed) then self.doorClosed:Remove() end
     if IsValid(self.doorOpen)   then self.doorOpen:Remove() end
 
-    -- Store tumble kinematics for Think to integrate
-    self.tumbleVel = Vector(
-        math.Rand(-120, 120),
-        math.Rand(-120, 120),
-        math.Rand(-60, 60)
-    )
-    self.tumbleAV  = Angle(
-        math.Rand(-30, 30),
-        math.Rand(-60, 60),
-        math.Rand(-45, 45)
-    )
+    self:FadeAndStopSounds(0.3)
+    self:StartTumble()
+
+    timer.Simple(12, function()
+        if IsValid(self) then self:CrashExplode() end
+    end)
 end
 
 function ENT:CrashExplode()
-    local pos = self:GetPos()
+    if self.TumbleCrashed then return end
+    self.TumbleCrashed = true
 
-    local ed = EffectData()
-    ed:SetOrigin(pos)
-    ed:SetScale(3.5)
-    util.Effect("Explosion", ed)
+    local safePos = FindSafeCrashOrigin(self:GetPos(), self.CenterPos)
 
-    for idx, mdl in ipairs(GIB_MODELS) do
-        timer.Simple((idx - 1) * 0.1, function()
-            local g = ents.Create("prop_physics")
-            if not IsValid(g) then return end
-            g:SetModel(mdl)
-            g:SetPos(pos + VectorRand() * 80)
-            g:SetAngles(AngleRand())
-            g:Spawn()
-            g:Activate()
-            local ph = g:GetPhysicsObject()
-            if IsValid(ph) then
-                ph:SetVelocity(VectorRand() * 400 + Vector(0, 0, 200))
-                ph:ApplyTorqueCenter(VectorRand() * 4000)
-            end
-            timer.Simple(12, function() if IsValid(g) then g:Remove() end end)
-        end)
+    local function boom(origin, sc)
+        local ed = EffectData()
+        ed:SetOrigin(origin) ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc * 100)
+        util.Effect("500lb_air", ed, true, true)
     end
+    local ed1 = EffectData()
+    ed1:SetOrigin(safePos) ed1:SetScale(6) ed1:SetMagnitude(6) ed1:SetRadius(600)
+    util.Effect("HelicopterMegaBomb", ed1, true, true)
+    boom(safePos, 5)
+    boom(safePos + Vector(0,0,80),  4)
+    boom(safePos + Vector(0,0,180), 3)
+    sound.Play("ambient/explosions/explode_8.wav", safePos, 140, 90, 1.0)
+    sound.Play("weapon_AWP.Single",                safePos, 145, 60, 1.0)
+    util.BlastDamage(self, self, safePos, 400, 200)
 
-    self:EmitSound("ambient/explosions/explode_" .. math.random(1, 9) .. ".wav", 175, 80)
+    SpawnGibs(safePos, self.CenterPos)
     self:Remove()
 end
 
@@ -344,7 +620,8 @@ end
 --  Cleanup
 -- ============================================================
 function ENT:OnRemove()
-    if self.engineSound then self.engineSound:Stop() end
+    self:StopAllSounds()
+    hook.Remove("OnEntityCreated", "mi12_relationship_hook_" .. self:EntIndex())
     if IsValid(self.doorClosed) then self.doorClosed:Remove() end
     if IsValid(self.doorOpen)   then self.doorOpen:Remove() end
 end
