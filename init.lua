@@ -1,4 +1,6 @@
 --DO NOT EDIT OR REUPLOAD THIS FILE
+-- SetNWBool("CargoDoorOpen") added so cl_init vapor/light effects
+-- receive reliable open/close signals from the server.
 
 AddCSLuaFile( "shared.lua" )
 AddCSLuaFile( "cl_init.lua" )
@@ -14,6 +16,7 @@ function ENT:SpawnFunction( ply, tr, ClassName )
 	ent:Activate()
 	
 	ent.doornum = 1
+	ent:SetNWBool( "CargoDoorOpen", false )  -- init networked door state
 	
 	ent.doormdl = ents.Create( "prop_physics" )
 	ent.doormdl:SetModel( "models/tfre/vehicles/Mi12_Homer_Door_Closed.mdl" )
@@ -24,13 +27,13 @@ function ENT:SpawnFunction( ply, tr, ClassName )
 	ent.doormdl:SetPos( ent:GetPos() )
 	ent.doormdl:SetAngles( ent:GetAngles() )
 	ent.doormdl.DoNotDuplicate = true
-	ent.doormdl:SetParent( ent ) --new method
+	ent.doormdl:SetParent( ent )
 	ent.doormdl:Spawn()
 	
 	ent.doormdl2:SetPos( ent:GetPos() )
 	ent.doormdl2:SetAngles( ent:GetAngles() )
 	ent.doormdl2.DoNotDuplicate = true
-	ent.doormdl2:SetParent( ent ) --new method
+	ent.doormdl2:SetParent( ent )
 	ent.doormdl2:Spawn()
 	
 	ent.doormdl:SetNotSolid(true)
@@ -50,6 +53,7 @@ function ENT:OnTick()
 end
 
 function ENT:RunOnSpawn()
+	self:SetNWBool( "CargoDoorOpen", false )  -- safety: ensure NW var exists on server ent
 	local PassengerSeats = {
 		{
 			pos = Vector(660,27,126),
@@ -76,13 +80,17 @@ function ENT:PrimaryAttack()
 	self:SetNextPrimary( 1 )
 	
 	if self.doornum == 0 then
+		-- Doors are closing -> open them
 		self:PlayAnimation("Open")
 		self.doormdl:SetNotSolid(true)
 		self.doornum = 1
+		self:SetNWBool( "CargoDoorOpen", true )   -- signal clients: trigger vapor + light
 	else
+		-- Doors are open -> close them
 		self:PlayAnimation("Close")
 		self.doormdl:SetNotSolid(false)
 		self.doornum = 0
+		self:SetNWBool( "CargoDoorOpen", false )  -- signal clients: stop effects
 	end
 end
 
