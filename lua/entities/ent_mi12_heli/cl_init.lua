@@ -1,6 +1,11 @@
 -- ============================================================
 --  MI-12 Homer — Client FX + Rotor Animation
 --  lua/entities/ent_mi12_heli/cl_init.lua
+--
+--  PORT from C-17 Globemaster III:
+--    • Persistent vapor emitter that follows the craft every frame
+--      (replaces the one-shot EmitCondensationCloud snapshot)
+--    • Dynamic pulsing cargo light during door open (UpdateCargoLight)
 -- ============================================================
 
 include("shared.lua")
@@ -22,6 +27,30 @@ local TIER_BURST_DELAY = { [1] = 5.0, [2] = 2.5, [3] = 0.9 }
 local TIER_BURST_COUNT = { [1] = 1,   [2] = 2,   [3] = 4   }
 
 local PlaneStates = {}
+
+-- ============================================================
+--  VAPOR / CONDENSATION CONFIG  (ported from C-17)
+--  Emitter is kept alive and fed new particles every frame while
+--  the door is open, so the origin always follows the helicopter.
+-- ============================================================
+local VAPOR_DURATION   = 1.8   -- seconds vapor lasts after door opens
+local VAPOR_LOCAL      = Vector(-700, 0, -60)  -- tail ramp local offset
+local VAPOR_PER_FRAME  = 5
+local VAPOR_LIFETIME   = 1.6
+local VAPOR_SIZE_START = 70
+local VAPOR_SIZE_END   = 220
+local VAPOR_SPEED      = 60    -- rearward m/s
+local VAPOR_SPRITE     = "particle/particle_smokegrenade"
+
+-- ============================================================
+--  CARGO DOOR DYNAMIC LIGHT  (ported from C-17)
+-- ============================================================
+local CARGO_LIGHT_LOCAL    = Vector(-700, 0, -60)  -- same as vapor origin
+local CARGO_LIGHT_RADIUS   = 1200
+local CARGO_LIGHT_DECAY    = 1000
+local CARGO_LIGHT_MIN_BRIG = 0.3
+local CARGO_LIGHT_MAX_BRIG = 1.0
+local CARGO_LIGHT_PULSE_HZ = 0.5  -- pulses per second
 
 -- ============================================================
 --  BURST EFFECTS
@@ -98,67 +127,27 @@ local function ApplyFlameParticles(ent, state, tier)
 end
 
 -- ============================================================
---  CONDENSATION CLOUD
---  Only fires when the door OPENS (isOpen == true).
--- ============================================================
-local TAIL_LOCAL_OFFSET = Vector(-700, 0, -60)
-local CLOUD_PUFF_COUNT  = 6
-local CLOUD_SPREAD_XY   = 55
-local CLOUD_SPREAD_Z    = 30
-
-local function EmitCondensationCloud(ent)
-    if not IsValid(ent) then return end
-    local pos = ent:GetPos()
-    local ang = ent:GetAngles()
-    local tailW       = LocalToWorld(TAIL_LOCAL_OFFSET, Angle(0, 0, 0), pos, ang)
-    local heliForward = ang:Forward()
-
-    for _ = 1, CLOUD_PUFF_COUNT do
-        local scatter = Vector(
-            math.Rand(-CLOUD_SPREAD_XY, CLOUD_SPREAD_XY),
-            math.Rand(-CLOUD_SPREAD_XY, CLOUD_SPREAD_XY),
-            math.Rand(0, CLOUD_SPREAD_Z)
-        )
-        local puffPos = tailW + scatter
-
-        local emitter = ParticleEmitter(puffPos)
-        if not emitter then continue end
-
-        for _ = 1, 3 do
-            local jitter = Vector(math.Rand(-15,15), math.Rand(-15,15), math.Rand(-8,8))
-            local p = emitter:Add("particle/particle_smokegrenade", puffPos + jitter)
-            if p then
-                p:SetColor(240, 240, 240)
-                p:SetStartAlpha(200)
-                p:SetEndAlpha(0)
-                p:SetDieTime(math.Rand(1.2, 2.2))
-                p:SetStartSize(math.Rand(60, 110))
-                p:SetEndSize(math.Rand(180, 280))
-                p:SetRoll(math.Rand(0, 360))
-                p:SetRollDelta(math.Rand(-0.8, 0.8))
-                p:SetVelocity(
-                    heliForward * -80 +
-                    Vector(math.Rand(-40,40), math.Rand(-40,40), math.Rand(30,90))
-                )
-                p:SetGravity(Vector(0, 0, 12))
-                p:SetAirResistance(140)
-                p:SetCollide(false)
-                p:SetBounce(0)
-            end
-        end
-        emitter:Finish()
-    end
-end
-
--- ============================================================
 --  NET — door event
---  Cloud only emitted on open (isOpen == true).
+--  On open:  start persistent vapor emitter (follows craft each frame)
+--  On close: stop emitter
 -- ============================================================
 net.Receive("MI12_DoorEvent", function()
     local ent    = net.ReadEntity()
     local isOpen = net.ReadBool()
+    if not IsValid(ent) then return end
+
     if isOpen then
-        EmitCondensationCloud(ent)
+        -- Start (or restart) the persistent vapor emitter
+        if ent._MI12VaporEmitter then
+            ent._MI12VaporEmitter:Finish()
+        end
+        local worldPos = LocalToWorld(VAPOR_LOCAL, Angle(0, 0, 0), ent:GetPos(), ent:GetAngles())
+        ent._MI12VaporEmitter = ParticleEmitter(worldPos, true)
+        ent._MI12VaporUntil   = CurTime() + VAPOR_DURATION
+        ent._MI12DoorOpen     = true
+    else
+        ent._MI12DoorOpen = false
+        -- Let the emitter drain naturally; stop feeding it in Think
     end
 end)
 
@@ -219,6 +208,83 @@ hook.Add("Think", "bombin_mi12_damage_fx", function()
                 end
             end
         end
+    end
+end)
+
+-- ============================================================
+--  THINK — persistent vapor emitter (follows craft each frame)
+--          ported from C-17 ENT:UpdateVapor()
+-- ============================================================
+hook.Add("Think", "bombin_mi12_vapor_update", function()
+    local ct = CurTime()
+    for _, ent in ipairs(ents.FindByClass("ent_mi12_heli")) do
+        if not IsValid(ent) then continue end
+        local emitter = ent._MI12VaporEmitter
+        if not emitter then continue end
+
+        -- Let emitter expire naturally once VAPOR_DURATION has passed
+        if ct >= (ent._MI12VaporUntil or 0) then
+            emitter:Finish()
+            ent._MI12VaporEmitter = nil
+            continue
+        end
+
+        -- Re-evaluate world origin every frame so it sticks to the craft
+        local worldPos = LocalToWorld(VAPOR_LOCAL, Angle(0, 0, 0), ent:GetPos(), ent:GetAngles())
+        local rearDir  = ent:LocalToWorldAngles(Angle(5, 180, 0)):Forward()
+
+        for _ = 1, VAPOR_PER_FRAME do
+            local p = emitter:Add(VAPOR_SPRITE, worldPos)
+            if p then
+                local shade = math.random(210, 255)
+                p:SetColor(shade, shade, shade)
+                p:SetStartAlpha(math.random(160, 200))
+                p:SetEndAlpha(0)
+                p:SetStartSize(VAPOR_SIZE_START + math.Rand(-8, 8))
+                p:SetEndSize(VAPOR_SIZE_END + math.Rand(-20, 20))
+                p:SetLifeTime(0)
+                p:SetDieTime(VAPOR_LIFETIME + math.Rand(-0.2, 0.4))
+                p:SetLighting(false)
+                local scatter = Vector(
+                    math.Rand(-40, 40),
+                    math.Rand(-40, 40),
+                    math.Rand(-12, 20)
+                )
+                p:SetVelocity(rearDir * VAPOR_SPEED + scatter)
+                p:SetGravity(Vector(0, 0, 14))
+                p:SetRoll(math.Rand(0, 360))
+                p:SetRollDelta(math.Rand(-1.2, 1.2))
+                p:SetAirResistance(80)
+            end
+        end
+    end
+end)
+
+-- ============================================================
+--  THINK — dynamic pulsing cargo light during door open
+--          ported from C-17 ENT:UpdateCargoLight()
+-- ============================================================
+hook.Add("Think", "bombin_mi12_cargo_light", function()
+    for _, ent in ipairs(ents.FindByClass("ent_mi12_heli")) do
+        if not IsValid(ent) then continue end
+        if not ent._MI12DoorOpen then continue end
+
+        local dl = DynamicLight(ent:EntIndex() + 4096)
+        if not dl then continue end
+
+        local t      = CurTime() * CARGO_LIGHT_PULSE_HZ * math.pi * 2
+        local frac   = (math.sin(t) + 1) * 0.5
+        local bright = CARGO_LIGHT_MIN_BRIG + frac * (CARGO_LIGHT_MAX_BRIG - CARGO_LIGHT_MIN_BRIG)
+
+        local worldPos = LocalToWorld(CARGO_LIGHT_LOCAL, Angle(0, 0, 0), ent:GetPos(), ent:GetAngles())
+        dl.pos        = worldPos
+        dl.r          = 255
+        dl.g          = 20
+        dl.b          = 10
+        dl.brightness = bright * 10
+        dl.decay      = CARGO_LIGHT_DECAY
+        dl.size       = CARGO_LIGHT_RADIUS
+        dl.dietime    = CurTime() + 0.1
     end
 end)
 
